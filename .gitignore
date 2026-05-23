@@ -1,0 +1,16 @@
+# Datasets (regenerate via shared/fetch_dataset.py -- too large for git)
+data/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Claude Code state
+.claude/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
