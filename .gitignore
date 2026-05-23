@@ -6,8 +6,9 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Claude Code state
-.claude/
+# Claude Code state (but keep project-scope skills)
+.claude/*
+!.claude/skills/
 
 # Editor / OS
 .DS_Store
