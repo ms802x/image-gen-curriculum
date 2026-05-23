@@ -1,6 +1,8 @@
 # Image Generation — Engineering Curriculum
 
-A from-scratch, code-first journey through modern image generation. The goal is **engineering competence** — understanding latency, memory, parameter counts, sampling speed, training compute, and the engineering levers that move quality on real hardware. Theory is included only where it changes an implementation choice.
+> ⚠️ **Status: under active development.** This curriculum is incomplete and the existing material may change without notice. Only Day 1 is currently published; later days are planned but not written. Use at your own risk and expect breaking changes.
+
+A from-scratch, code-first journey through modern image generation. The goal is **engineering competence for low-resource deployment** — understanding latency, memory, parameter counts, sampling speed, training compute, and the engineering levers that move quality on small GPUs and edge-class compute. Theory is included only where it changes an implementation choice.
 
 ## What's here
 
@@ -18,7 +20,7 @@ See [`CURRICULUM.md`](./CURRICULUM.md) for the full plan. Summary:
 | 4 | Latent diffusion, SDXL, LoRA fine-tune | planned |
 | 5 | DiT, flow matching, FLUX, SD3 | planned |
 | 6 | Distillation — Turbo, Lightning, LCM, consistency models | planned |
-| 7 | Autoregressive (VAR/MaskGIT) + L4 deployment | planned |
+| 7 | Autoregressive (VAR/MaskGIT) + low-resource deployment | planned |
 
 ## Dataset
 
@@ -34,7 +36,7 @@ This downloads the full set into `data/full/` and saves a 10-image sample into `
 
 ## Hardware notes
 
-The notebooks are written for a single H100 (80GB) but are deliberately small enough to run on any modern GPU. Per-cell wall-times are reported in each notebook's training output. End deployment target: L4 (24GB) via quantization and step-distilled diffusion (covered Day 7).
+The notebooks are written for a single H100 (80GB) but are deliberately small enough to run on any modern GPU. Per-cell wall-times are reported in each notebook's training output. **End deployment target: low-resource compute** — small data-center GPUs (L4, T4, A10), consumer cards, or on-device inference — reached via quantization, step-distilled diffusion, and architecture choices (covered Day 7).
 
 ## Layout
 

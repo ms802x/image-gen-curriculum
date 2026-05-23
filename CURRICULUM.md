@@ -1,6 +1,6 @@
 # Image Generation — 7-Day Engineering Curriculum
 
-**Hardware:** H100 80GB (training) → L4 24GB (deployment target).
+**Hardware:** H100 80GB for training; deployment target is **low-resource compute** generally (small GPUs like L4 / T4 / A10, consumer cards, or on-device — the curriculum doesn't pin to a single chip).
 **Budget:** 6 hours/day × 7 days = 42 hours.
 **Data:** `lambdalabs/naruto-blip-captions` — 1,221 native-512² anime images with BLIP captions. First 1,000 used for from-scratch training (Days 1–3, 5); full set in `data/full/` for the Day 4 style-LoRA fine-tune. This is the canonical SD fine-tune demo dataset, so your numbers will be directly comparable to public benchmarks.
 **Protocol every lesson (revised after Day 1):** train ~1,000 images for enough epochs to *visibly converge* (typically 50–200, batch 32), sample the same fixed prompts/seeds, save a comparison grid, log params / peak-VRAM / step-latency / total-train-time / training-loss-curves to `results/master_table.md`. You rate quality; the table holds the numbers. **Every concept gets a worked numerical example** — toy demos, gradient checks, parameter-sweep tables. No vague prose.
@@ -18,8 +18,8 @@ The field's history is also the right pedagogical order:
 3. **Score-based + samplers + CFG (2020–2022)** — the unification that made diffusion controllable and 50× faster at inference.
 4. **Latent diffusion / SDXL (2022–2023)** — the engineering insight (compress, then diffuse) that made it deployable. LoRA fine-tuning.
 5. **DiT + Flow Matching / Flux + SD3 (2023–2024)** — UNet→Transformer transition; rectified flow as the new training objective that enables fewer sampling steps natively.
-6. **Distillation / few-step (2023–2025)** — Turbo, Lightning, LCM, DMD. The "make it fast" lineage that gets you to L4-friendly latencies.
-7. **Autoregressive resurgence + deployment (2024–2026)** — VAR/Infinity-class AR models reclaim parts of SOTA; quantization & TensorRT to actually ship on L4.
+6. **Distillation / few-step (2023–2025)** — Turbo, Lightning, LCM, DMD. The "make it fast" lineage that brings diffusion latency to small-GPU-friendly numbers.
+7. **Autoregressive resurgence + deployment (2024–2026)** — VAR/Infinity-class AR models reclaim parts of SOTA; quantization & TensorRT to ship on low-resource compute.
 
 By Day 7 you have a master table with every approach side-by-side. That's the artifact.
 
@@ -95,11 +95,11 @@ By Day 7 you have a master table with every approach side-by-side. That's the ar
 - `day6/cm_distill.ipynb`: distill your Day 2 DDPM into a consistency model on the 1000-image set. Sample at 1/2/4/8 steps.
 - `day6/turbo_lightning_lcm.py`: run SDXL-Turbo, SDXL-Lightning (2/4/8-step variants), LCM-LoRA on SDXL, Flux-schnell. All on the same prompts.
 
-**Compare (1.5h)** — The **money plot of the week:** x-axis = sampling steps (1 to 50, log scale), y-axis = latency *and* your quality rating, one line per model. This plot tells you which model to pick for your L4 target.
+**Compare (1.5h)** — The **money plot of the week:** x-axis = sampling steps (1 to 50, log scale), y-axis = latency *and* your quality rating, one line per model. This plot tells you which model to pick under your resource constraints.
 
 ---
 
-## Day 7 (6h) — Autoregressive + L4 deployment
+## Day 7 (6h) — Autoregressive + low-resource deployment
 
 **Theory (1.5h)** — **VQ-VAE:** discrete tokens via vector quantization, image becomes a sequence of codes. **MaskGIT/Muse:** parallel masked decoding, ~10× faster than raster AR. **VAR (next-scale prediction, NeurIPS '24 best paper):** AR over scales not pixels — currently beats diffusion on some ImageNet metrics with lower latency. **Infinity (2024):** bitwise tokenization, scales VAR. Why AR is interesting again: KV-cache + speculative decoding tricks from LLMs transfer directly.
 
@@ -107,11 +107,11 @@ By Day 7 you have a master table with every approach side-by-side. That's the ar
 - `day7/vqvae_maskgit.ipynb`: tiny VQ-VAE + MaskGIT-style parallel decoder on the 1000-image set. Didactic — won't beat your diffusion models, but you'll feel the token-grid mental model.
 
 **Deploy (2.5h)** —
-- `day7/quantize_l4.py`: take your best fast model from Day 6 (likely SDXL-Lightning 4-step or Flux-schnell). Quantize to INT8 weights via `bitsandbytes` and FP8 via `torchao` if applicable. Optionally export ONNX and benchmark with TensorRT.
-- Project L4 latency: L4 has ~30 TFLOPS FP16 vs H100 ~990 TFLOPS bf16 ≈ **33× slower compute**, but L4 has 24GB VRAM which is enough for SDXL-Lightning-INT8 and Flux-schnell-Q4. The actual rule of thumb you'll verify: small batch SDXL on L4 is closer to ~10× slower than H100, not 33×, because memory bandwidth dominates inference.
-- Benchmark on H100, multiply by your measured slowdown ratio, predict L4. (Or `vast.ai` an L4 for an hour at the end — ~$0.40 — for ground truth.)
+- `day7/quantize_low_resource.py`: take your best fast model from Day 6 (likely SDXL-Lightning 4-step or Flux-schnell). Quantize to INT8 weights via `bitsandbytes` and FP8 via `torchao` where applicable. Optionally export ONNX and benchmark with TensorRT.
+- Project latency on a low-resource target. Reference numbers (compute vs H100's ~990 TFLOPS bf16): L4 ~30 TFLOPS FP16 (~33× slower); T4 ~8 TFLOPS FP16; A10 ~125 TFLOPS FP16. **Rule of thumb to verify empirically:** small-batch SDXL on a small data-center GPU is typically closer to ~10× slower than H100, not 33×, because memory bandwidth dominates inference, not raw FLOPs.
+- Benchmark on H100, multiply by your measured slowdown ratio against the target GPU, and project. For ground truth, rent the target on `vast.ai` for an hour (≈ $0.40 for L4, less for T4).
 
-**Wrap (0.5h)** — Fill the master table's final rows. Pick the model you'd ship on L4 and write 3 sentences on why.
+**Wrap (0.5h)** — Fill the master table's final rows. Pick the model you'd ship under your resource constraints and write 3 sentences on why.
 
 ---
 
@@ -135,7 +135,7 @@ By Day 7 you have a master table with every approach side-by-side. That's the ar
 | 6 | CM (yours) | 5M | … | … | 1 / 4 | … | … | …/10 |
 | 7 | VQ-VAE + MaskGIT | … | … | … | 8 | … | … | …/10 |
 | 7 | SDXL-Lightning INT8 | 2.6B | — | … | 4 | … | … | …/10 |
-| 7 | Flux-schnell (L4 projected) | 12B | — | … | 4 | … | … | …/10 |
+| 7 | Flux-schnell (low-resource projected) | 12B | — | … | 4 | … | … | …/10 |
 
 ---
 
