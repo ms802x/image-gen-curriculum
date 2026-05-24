@@ -41,7 +41,7 @@ cells.append(md("""\
 This notebook walks through Denoising Diffusion Probabilistic Models — but instead of writing the algorithm from scratch (where small subtle bugs can give bad samples), we use a published reference: **[`YHL04/ddpm`](https://github.com/YHL04/ddpm)**. The teaching cells explain what the code does and why; the engineering choices are exactly those in that repository, not my own invention.
 
 **Protocol**
-- **Dataset:** same 200 anime images we used for Day 1, resized to 64×64, normalized to [−1, 1].
+- **Dataset:** the full naruto-blip set (1,221 anime images), resized to 64×64, normalized to [−1, 1]. (The 200-image subset from Day 1 was too data-starved for diffusion to learn fine structure.)
 - **Algorithm:** Improved DDPM (Nichol & Dhariwal 2021): cosine β-schedule, learned variance via `v`-head, hybrid loss (simple ε-MSE + λ·variational bound), min-SNR-γ loss weighting.
 - **Model:** UNet from `YHL04/ddpm` verbatim (ε-prediction + v-head). Smaller channel multipliers than the repo default to fit our 200-image scale.
 - **Sampling:** full T-step DDPM reverse process exactly as the repo implements it, with the crucial `x_recon.clamp_(-1, 1)` line that prevents the divide-by-tiny-√ᾱ_t explosion at high t.
@@ -76,10 +76,10 @@ from shared.grid import to_uint8_grid, save_grid
 
 DEVICE   = "cuda"
 IMG_SIZE = 64
-N_TRAIN  = 200
+N_TRAIN  = 1221           # full naruto-blip set -- the 200-image subset was data-starved
 BATCH    = 32
 T_STEPS  = 1000           # diffusion steps (same as the repo)
-EPOCHS   = 2000           # ~13k gradient updates at N=200, batch=32
+EPOCHS   = 1500           # N=1221, batch=32 -> ~38 steps/epoch -> ~57k gradient updates
 LR       = 2e-4
 SEED     = 0
 
@@ -781,9 +781,20 @@ plt.tight_layout(); plt.show()
 # Sampling
 # ============================================================================
 cells.append(md("""\
-## Sampling at different step counts
+## Sampling at different step counts — and why fewer steps looks worse here
 
-The repo's `plot_denoising_process` runs the full reverse process with an optional `step` parameter that sub-samples timesteps. We use the same idea — run the same reverse process but visit every k-th step. This is *DDPM*-style sub-sampling (still uses the stochastic posterior with learned variance), not DDIM.
+The repo's `sample` runs the reverse process with an optional `step` parameter that visits every k-th timestep. **Important:** this is *naive* sub-sampling, not DDIM. The `backward_step` function uses **per-step** schedule constants (`betas[t]`, `posterior_variance[t]`) that were derived assuming we move from $t$ to $t-1$ — a one-timestep jump.
+
+When `step=50`, we still call the per-step update, but we *actually* jump 50 timesteps between calls. The cumulative coefficients you'd need for a 50-step leap (e.g. $1 - \\bar\\alpha_{t-50}/\\bar\\alpha_t$ instead of $\\beta_t$) are never computed. The trajectory drifts off the manifold the model was calibrated on.
+
+**Consequence you'll see in the grid below: step=1 (full 1000 NN evals) looks visibly better than step=50, even though step=50 is ~50× faster.** That's not a coincidence — it's the cost of naive sub-sampling.
+
+In production, no one uses this method for few-step sampling. Modern fast samplers are different objects:
+- **DDIM** (Song et al. 2020, [arXiv 2010.02502](https://arxiv.org/abs/2010.02502)) — reformulates the reverse as a deterministic ODE whose integration is correct at any step count. Same trained model.
+- **DPM-Solver / DPM-Solver++** (Lu et al. 2022) — higher-order ODE solvers. ~20 steps ≈ DDPM-1000 quality.
+- **Distillation** (Consistency Models, SDXL Turbo, SDXL Lightning, FLUX-schnell) — train a separate model to do in 1–4 steps what DDPM-1000 does. Day 6.
+
+The step-comparison below is therefore teaching the *motivation* for those methods, not their alternatives.
 
 Same `EVAL_NOISE` starting point for every step count, so columns of the grids are comparable.
 """))
