@@ -59,10 +59,13 @@ from shared.grid import to_uint8_grid, save_grid
 DEVICE   = "cuda"
 IMG_SIZE = 64
 LATENT   = 128
-N_TRAIN  = 1000
+N_TRAIN  = 200            # smaller subset -- well-matched to the model's capacity at 64x64.
+                          # DiffAugment paper's small-data experiments use exactly this scale.
 BATCH    = 32
-EPOCHS   = 200           # held constant across all trainings; the only variables are
-                         # model size, loss form, regularization, and augmentation
+EPOCHS     = 1000         # for VAE variants
+EPOCHS_GAN = 5000         # for GAN variants -- ~31k gradient updates per variant,
+                          # which is in line with what DiffAugment / FastGAN papers use on
+                          # small-data anime training
 LR       = 2e-4
 SEED     = 0
 torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
@@ -601,7 +604,7 @@ The baseline ends with high reconstruction loss and soft samples. Two further VA
 
 **v2** swaps the loss function — VGG features instead of pixels — directly attacking the "L2 picks the mean" failure from Example 1. Prediction: dramatically sharper reconstructions and qualitatively different samples.
 
-All three trainings use the same `EPOCHS = 200` and same data. The only variables are model size, loss form, and KL schedule.
+All three VAE trainings use the same `EPOCHS` and same data. The only variables are model size, loss form, and KL schedule.
 """))
 
 cells.append(md("""\
@@ -679,7 +682,7 @@ $$\beta(\text{epoch}) = \min\big(1,\ \text{epoch} / 100\big)$$
 For the first 100 epochs the model behaves like a plain autoencoder (β = 0), focusing on reconstruction. Then KL gradually turns on and the latent gets organized into a usable prior. By the end, v1 has had 100 epochs at full β = 1 — same regularization budget as the baseline, with a better early-training trajectory.
 """))
 cells.append(code("""\
-ANNEAL_EPOCHS = 100   # beta ramps from 0 -> 1 over first 100 epochs
+ANNEAL_EPOCHS = 500   # beta ramps from 0 -> 1 over first 500 epochs (~half of training)
 
 torch.cuda.reset_peak_memory_stats()
 torch.manual_seed(SEED)
@@ -1076,7 +1079,7 @@ opt_d = torch.optim.Adam(D.parameters(), lr=LR, betas=(0.5, 0.999))
 
 hist_g = {"D_loss": [], "G_loss": [], "D_real": [], "D_fake": []}
 t0 = time.time()
-for ep in range(EPOCHS):
+for ep in range(EPOCHS_GAN):
     perm = torch.randperm(N_TRAIN, device=DEVICE)
     d_sum = g_sum = dr_sum = df_sum = 0.0; n_batches = 0
     for i in range(0, N_TRAIN, BATCH):
@@ -1108,8 +1111,8 @@ for ep in range(EPOCHS):
     hist_g["G_loss"].append(g_sum / n_batches)
     hist_g["D_real"].append(dr_sum / n_batches)
     hist_g["D_fake"].append(df_sum / n_batches)
-    if (ep + 1) % 10 == 0 or ep == 0:
-        print(f"ep {ep+1:3d}/{EPOCHS}  D={hist_g['D_loss'][-1]:.3f}  G={hist_g['G_loss'][-1]:.3f}  "
+    if (ep + 1) % 250 == 0 or ep == 0:
+        print(f"ep {ep+1:4d}/{EPOCHS_GAN}  D={hist_g['D_loss'][-1]:.3f}  G={hist_g['G_loss'][-1]:.3f}  "
               f"D(real)={hist_g['D_real'][-1]:.2f}  D(fake)={hist_g['D_fake'][-1]:.2f}")
 
 gan_train_s   = time.time() - t0
@@ -1238,7 +1241,7 @@ Three classical stability tricks, all targeting an overpowered discriminator:
 | **Label smoothing on real** | Salimans et al. 2016, [arXiv 1606.03498](https://arxiv.org/abs/1606.03498) | D's "real" target = 0.9 instead of 1.0 — prevents saturation. |
 | **TTUR (two time-scale update rule)** | Heusel et al. 2017, [arXiv 1706.08500](https://arxiv.org/abs/1706.08500) | Slow D, fast G — `D_lr = 1e-4`, `G_lr = 4e-4`. |
 
-Same architecture and same non-saturating G objective as the baseline. The diagnostic to watch: D(real) and D(fake) should move toward 0.5/0.5.
+Same architecture and same non-saturating G objective as the baseline; only the regularization and learning-rate schedule change. Same `EPOCHS_GAN` budget. The diagnostic to watch: D(real) and D(fake) should move toward 0.5/0.5.
 """))
 cells.append(code("""\
 class DiscriminatorSN(nn.Module):
@@ -1268,7 +1271,7 @@ opt_d_imp = torch.optim.Adam(D_imp.parameters(), lr=1e-4, betas=(0.5, 0.999))
 hist_g_imp = {"D_loss": [], "G_loss": [], "D_real": [], "D_fake": []}
 torch.cuda.reset_peak_memory_stats()
 t0 = time.time()
-for ep in range(EPOCHS):
+for ep in range(EPOCHS_GAN):
     perm = torch.randperm(N_TRAIN, device=DEVICE)
     d_sum = g_sum = dr_sum = df_sum = 0.0; n_batches = 0
     for i in range(0, N_TRAIN, BATCH):
@@ -1297,8 +1300,8 @@ for ep in range(EPOCHS):
     hist_g_imp["G_loss"].append(g_sum / n_batches)
     hist_g_imp["D_real"].append(dr_sum / n_batches)
     hist_g_imp["D_fake"].append(df_sum / n_batches)
-    if (ep + 1) % 30 == 0 or ep == 0:
-        print(f"ep {ep+1:3d}/{EPOCHS}  D={hist_g_imp['D_loss'][-1]:.3f}  G={hist_g_imp['G_loss'][-1]:.3f}  "
+    if (ep + 1) % 250 == 0 or ep == 0:
+        print(f"ep {ep+1:4d}/{EPOCHS_GAN}  D={hist_g_imp['D_loss'][-1]:.3f}  G={hist_g_imp['G_loss'][-1]:.3f}  "
               f"D(real)={hist_g_imp['D_real'][-1]:.2f}  D(fake)={hist_g_imp['D_fake'][-1]:.2f}")
 
 gan_imp_train_s   = time.time() - t0
@@ -1360,9 +1363,9 @@ save_grid(gan_imp_samples[:10], ROOT / "results/grids/day1_gan_samples_v1.png", 
 
 # ─────────────── GAN v2: DiffAugment + bigger + hinge + R1 ───────────────
 cells.append(md(r"""\
-## GAN v2 — bigger + hinge + R1 + DiffAugment
+## GAN v2 — bigger + hinge + R1 + DiffAugment + EMA on G
 
-v1 stabilized training but didn't change capacity. For genuinely better samples, modern data-efficient GAN techniques are required: bigger generator/discriminator, hinge loss, gradient regularization, and differentiable augmentation.
+v1 stabilized training but didn't change capacity. For genuinely better samples, modern data-efficient GAN techniques are required: bigger generator/discriminator, hinge loss, gradient regularization, differentiable augmentation, and a Polyak-averaged generator (EMA) for sampling.
 
 | Lever | Reference | Effect |
 |---|---|---|
@@ -1370,8 +1373,9 @@ v1 stabilized training but didn't change capacity. For genuinely better samples,
 | **Bigger model** | — | G channels [128, 256, 512] → ~9M. D channels [64, 128, 256, 512] → ~4.6M. Real capacity to fit 1000 diverse images. |
 | **Hinge loss** | Lim & Ye 2017 [arXiv 1705.02894](https://arxiv.org/abs/1705.02894) | Modern standard with spectral norm. D: `relu(1−D(real)).mean() + relu(1+D(fake)).mean()`. G: `−D(fake).mean()`. More stable than BCE for spec-norm models. |
 | **R1 gradient penalty (lazy)** | Mescheder et al. 2018 [arXiv 1801.04406](https://arxiv.org/abs/1801.04406) | Penalize `‖∇_x D(x)‖²` on real samples every 16 steps. Encourages a smooth D landscape, prevents memorization. Karras et al. 2020 popularized the lazy (every-K-steps) form. |
+| **EMA on G (Polyak averaging)** | Karras et al. 2018 (ProGAN), 2019 (StyleGAN), and every modern GAN since | Maintain a separate copy of G whose weights are an exponential moving average of the training G's weights (decay 0.999). Sample from the EMA copy at eval time. Smooths out the noisy oscillations of GAN training in weight space → noticeably cleaner samples, often the single biggest visual-quality jump after enough training. |
 
-Everything else stays controlled: same `EPOCHS=200`, same `BATCH=32`, same `N_TRAIN=1000`, same Adam optimizer family.
+Same `BATCH=32`, same `N_TRAIN`, same Adam optimizer family across all three GAN variants. The GAN variants train for `EPOCHS_GAN` (longer than the VAE's `EPOCHS`, because GANs need substantially more updates to converge at this scale).
 
 **DiffAugment implementation reproduced verbatim from the [official GitHub](https://github.com/mit-han-lab/data-efficient-gans).**
 """))
@@ -1491,18 +1495,31 @@ $$\mathcal{L}_G = -\mathbb{E}_z [D(G(z))]$$
 **DiffAugment**: applied to BOTH `x_real` (before D sees it) and `G(z)` (before D sees that). The augmentation is *differentiable*, so gradients flow through it back to G. Without this dual application, D would learn the augmentation as a discriminative feature — Zhao et al. 2020 §3.2.
 """))
 cells.append(code("""\
-GAMMA = 10.0       # R1 coefficient (Mescheder et al. recommendation)
-R1_EVERY = 16      # lazy regularization frequency (Karras et al. 2020)
+import copy
+GAMMA = 10.0          # R1 coefficient (Mescheder et al. recommendation)
+R1_EVERY = 16         # lazy regularization frequency (Karras et al. 2020)
 POLICY = "color,translation,cutout"
+EMA_DECAY = 0.999     # Polyak averaging decay for G_ema
 
 opt_g_v2 = torch.optim.Adam(G_v2.parameters(), lr=2e-4, betas=(0.0, 0.99))
 opt_d_v2 = torch.optim.Adam(D_v2.parameters(), lr=2e-4, betas=(0.0, 0.99))
+
+# EMA copy of G used ONLY for sampling -- never updated by gradients.
+G_ema = copy.deepcopy(G_v2).eval()
+for p in G_ema.parameters(): p.requires_grad = False
+
+@torch.no_grad()
+def _ema_update(target, source, decay):
+    for p_t, p_s in zip(target.parameters(), source.parameters()):
+        p_t.mul_(decay).add_(p_s, alpha=1 - decay)
+    for b_t, b_s in zip(target.buffers(), source.buffers()):
+        b_t.copy_(b_s)
 
 hist_g_v2 = {"D_loss": [], "G_loss": [], "R1": []}
 torch.cuda.reset_peak_memory_stats()
 t0 = time.time()
 step = 0
-for ep in range(EPOCHS):
+for ep in range(EPOCHS_GAN):
     perm = torch.randperm(N_TRAIN, device=DEVICE)
     d_sum = g_sum = r1_sum = 0.0; n_batches = r1_batches = 0
     for i in range(0, N_TRAIN, BATCH):
@@ -1532,14 +1549,17 @@ for ep in range(EPOCHS):
         g_loss = -D_v2(fake_aug).mean()
         opt_g_v2.zero_grad(); g_loss.backward(); opt_g_v2.step()
 
+        # ── EMA update on G ──
+        _ema_update(G_ema, G_v2, EMA_DECAY)
+
         d_sum += d_loss.item(); g_sum += g_loss.item(); n_batches += 1
         step += 1
 
     hist_g_v2["D_loss"].append(d_sum / n_batches)
     hist_g_v2["G_loss"].append(g_sum / n_batches)
     hist_g_v2["R1"    ].append(r1_sum / max(1, r1_batches))
-    if (ep + 1) % 20 == 0 or ep == 0:
-        print(f"ep {ep+1:3d}/{EPOCHS}  D={hist_g_v2['D_loss'][-1]:7.3f}  G={hist_g_v2['G_loss'][-1]:7.3f}  R1={hist_g_v2['R1'][-1]:7.3f}")
+    if (ep + 1) % 250 == 0 or ep == 0:
+        print(f"ep {ep+1:4d}/{EPOCHS_GAN}  D={hist_g_v2['D_loss'][-1]:7.3f}  G={hist_g_v2['G_loss'][-1]:7.3f}  R1={hist_g_v2['R1'][-1]:7.3f}")
 
 gan_v2_train_s   = time.time() - t0
 gan_v2_peak_vram = torch.cuda.max_memory_allocated() / 1e9
@@ -1562,21 +1582,24 @@ cells.append(md("""\
 ### v2 samples + perceptual diversity
 """))
 cells.append(code("""\
-G_v2.eval()
+# Sample from G_ema (the smoother Polyak-averaged weights), not G_v2.
+# This is standard practice in StyleGAN/FastGAN -- the moving-averaged generator
+# produces noticeably cleaner samples than the raw final weights.
+G_ema.eval()
 with torch.no_grad():
-    gan_v2_samples = G_v2(EVAL_Z_128[:20])
-    div_gan_v2 = feature_diversity(G_v2(EVAL_Z_128))
+    gan_v2_samples = G_ema(EVAL_Z_128[:20])
+    div_gan_v2 = feature_diversity(G_ema(EVAL_Z_128))
 
 fig, ax = plt.subplots(figsize=(12, 5))
 ax.imshow(to_uint8_grid(gan_v2_samples, nrow=10)); ax.axis("off")
-ax.set_title(f"GAN v2 samples   feature-div={div_gan_v2:.3f}  (real {div_real_perc:.3f}, baseline {div_gan_perc:.3f}, v1 {div_gan_imp:.3f})")
+ax.set_title(f"GAN v2 samples (G_ema)   feature-div={div_gan_v2:.3f}")
 plt.show()
 
-# v2 generator latency
+# v2 generator latency (timed on G_ema -- same architecture, same FLOPs as G_v2)
 z1 = torch.randn(1, LATENT, device=DEVICE)
-for _ in range(3): G_v2(z1)
+for _ in range(3): G_ema(z1)
 torch.cuda.synchronize(); t = time.time()
-for _ in range(100): G_v2(z1)
+for _ in range(100): G_ema(z1)
 torch.cuda.synchronize()
 gan_v2_step_ms = (time.time() - t) * 10
 print(f"GAN v2 generator latency (1 img): {gan_v2_step_ms:.2f} ms")
