@@ -748,6 +748,85 @@ This is the bridge between the variational DDPM framing and the score-matching f
 
 ---
 
+## Q&A — what is `torch.cumprod` doing in `alpha_bars = torch.cumprod(alphas, dim=0)`?
+
+Common code line you'll see in every diffusion implementation:
+
+```python
+T = 200
+betas = torch.linspace(1e-4, 0.05, T)
+alphas = 1 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)
+```
+
+The `torch.cumprod` (cumulative product) is doing a precise mathematical job — let's unpack it.
+
+### What `cumprod` actually computes
+
+Given a tensor `alphas = [α_1, α_2, α_3, ..., α_T]`, the call `torch.cumprod(alphas, dim=0)` returns:
+
+```
+[α_1,   α_1·α_2,   α_1·α_2·α_3,   ...,   α_1·α_2·...·α_T]
+```
+
+Each entry is the running product up to that index. So `alpha_bars[k]` equals $\bar\alpha_{k+1}$ in the paper's 1-indexed notation — the product of all $\alpha_s$ from $s = 1$ to $s = k+1$.
+
+### Why a *product* and not a *sum*
+
+The DDPM math defines $\bar\alpha_t := \prod_{s=1}^{t} \alpha_s$. This product comes directly from the per-step forward recursion. From Section 4 of the notebook, the per-step rule:
+
+$$x_t = \sqrt{\alpha_t}\,x_{t-1} + \sqrt{1-\alpha_t}\,\varepsilon_t$$
+
+The signal at every step gets *multiplied* by $\sqrt{\alpha_t}$. Apply this $t$ times starting from $x_0$:
+
+$$x_1 = \sqrt{\alpha_1}\,x_0 + (\text{noise})$$
+$$x_2 = \sqrt{\alpha_2}\,x_1 + (\text{noise}) = \sqrt{\alpha_2 \alpha_1}\,x_0 + (\text{noise})$$
+$$x_3 = \sqrt{\alpha_3 \alpha_2 \alpha_1}\,x_0 + (\text{noise})$$
+$$\vdots$$
+$$x_t = \underbrace{\sqrt{\alpha_t \alpha_{t-1} \cdots \alpha_1}}_{=\sqrt{\bar\alpha_t}}\,x_0 + (\text{noise})$$
+
+**The signal scale at step $t$ is the product of all per-step scales up to step $t$.** Multiplicative compositions compose into products. (If forward steps were *additive* — e.g., $x_t = x_{t-1} + (\text{noise})$ — we'd use cumulative *sum* instead, and the closed-form formulas would have sums of betas. Diffusion steps are scaled multiplications, hence products.)
+
+### Why we need *cumulative* — the whole vector, not just the final scalar
+
+We use $\bar\alpha_t$ at **every** timestep, not just at the final $t = T$. The notebook uses it constantly:
+
+- `q_sample(x_0, t=10)` reads `alpha_bars[10]`.
+- `q_sample(x_0, t=100)` reads `alpha_bars[100]`.
+- The reverse sampler reads `alpha_bars[t]` at every $t$ as it iterates.
+
+Precomputing the whole vector once with `cumprod` gives us $O(T)$-time access to any $\bar\alpha_t$, vs $O(T^2)$ if we recomputed each product on demand.
+
+### Numerical example to internalize
+
+For our T=200 with linear β from 1e-4 to 0.05:
+
+| $t$ | $\beta_t$ | $\alpha_t = 1-\beta_t$ | $\bar\alpha_t$ (cumprod) |
+|---|---|---|---|
+| 0 | 0.0001 | 0.9999 | 0.9999 |
+| 1 | 0.0003 | 0.9997 | 0.9999 · 0.9997 ≈ 0.9996 |
+| 10 | ~0.003 | ~0.997 | ~0.985 |
+| 100 | ~0.025 | ~0.975 | ~0.062 |
+| 199 | 0.05 | 0.95 | ~0.006 |
+
+Each $\alpha_t$ is close to 1 (small per-step shrink), but the product **compounds**. By $t = 199$ the signal scale has shrunk to ~0.6% — essentially gone. The "diffusion" effect over many steps is *multiplicative compounding of many small shrinks*, which is exactly what `cumprod` captures.
+
+### Pen-and-paper exercise
+
+Verify by hand: with $\alpha_t = 0.99$ constant (i.e., $\beta = 0.01$ always) and $T = 100$:
+
+$$\bar\alpha_T = 0.99^{100} \approx 0.366, \qquad \sqrt{\bar\alpha_T} \approx 0.605$$
+
+So after 100 such steps the signal scale is about 60% of the original. To shrink to ~0 you need many more steps — that's why DDPM uses $T = 1000$ with $\bar\alpha_T \approx 4 \times 10^{-5}$.
+
+The exponential decay you see when plotting $\bar\alpha_t$ over $t$ (e.g., the second panel of Section 4 in the math notebook) is exactly $\text{cumprod}$: a product of many sub-1 numbers decays exponentially in the count of terms.
+
+### One-line summary
+
+`torch.cumprod(alphas, dim=0)` computes the vector of *cumulative per-step shrink factors* $[\bar\alpha_1, \bar\alpha_2, \ldots, \bar\alpha_T]$ — the signal scale of $x_t$ relative to $x_0$ at each timestep. Indexing into this precomputed vector lets the closed-form forward $q(x_t \mid x_0) = \mathcal{N}(\sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t)I)$ be evaluated in one tensor op at any $t$.
+
+---
+
 ## Further reading — the best resources to deepen this material
 
 **Honest preamble.** There is **no Goodfellow-Bengio-Courville-equivalent textbook for diffusion models** as of 2026. The field is too young and moves too fast for that kind of consolidation. What exists instead is a handful of *book-length tutorials* (PDFs and arXiv preprints) plus excellent blog posts. The list below ranks them by usefulness for the goal you stated: *understanding the math deeply*. Every entry is verified — links go to real, currently-available resources.
