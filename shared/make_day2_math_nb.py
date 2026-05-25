@@ -1,8 +1,13 @@
-"""Generate day2/day2_paper_math_to_code.ipynb -- math-to-code companion to the paper tutorial.
+"""Generate day2/day2_paper_math_to_code.ipynb -- math + visualizations companion to the paper tutorial.
 
-Each section pulls one equation from Ho, Jain, Abbeel 2020 (DDPM paper), translates it
-into runnable PyTorch, and verifies it numerically against either a Monte Carlo or
-analytical reference. No training -- this notebook runs in seconds.
+Pedagogical version: every concept explained from first principles, every equation
+visualized on 2D spiral data so the reader can SEE what the math does. Suitable for
+following along with pen and paper.
+
+Notation crash course → 2D spiral data → forward process visualized → toy MLP trained
+to reverse → score field visualized → KL/posterior visualized.
+
+No high-dimensional training; everything runs in well under a minute.
 """
 import json
 from pathlib import Path
@@ -23,558 +28,757 @@ cells = []
 # ============================================================================
 # Title
 # ============================================================================
-cells.append(md("""\
-# DDPM paper — math, in code
+cells.append(md(r"""\
+# DDPM — math, with visualizations
 
-A companion to **`day2/ddpm_paper_tutorial.md`**. The tutorial explains the equations in prose; this notebook *executes* them — every formula from the paper is paired with PyTorch code and a numerical check against an independent reference (Monte Carlo, analytical limit, or a known identity).
+A guided walk through the DDPM math using **2D toy data** so you can *see* every concept on a plot. The math we use is the same as on the page; only the data lives in 2 dimensions instead of in pixel space. This lets us draw scatter plots of the data distribution, the noised distribution, and the reverse process.
 
-**Scope.** Sections §2 and §3 of Ho, Jain, Abbeel (NeurIPS 2020). No model training in this notebook; the goal is to build intuition by *seeing the equations compute*.
+Companion to **`day2/ddpm_paper_tutorial.md`** (the prose walkthrough of the paper). Read the tutorial first if you want the high-level story; this notebook is the **"with my notebook and a pen" deep-dive** on the math, with every formula visualized.
 
-**Source paper.** [arXiv 2006.11239](https://arxiv.org/abs/2006.11239).
+**How to use this notebook.** Open a real notebook (paper kind). For each section:
+1. Read the math explanation.
+2. Look at the plot.
+3. Try to re-derive the equation on paper. The text is verbose specifically so you can check each step.
 
-**How to read this.**
-1. Each section begins with the paper equation it implements (verbatim or compact form).
-2. Then the equivalent PyTorch code.
-3. Then a *numerical check* showing the code reproduces the math.
-
-Everything is reproducible — fixed seeds, tiny tensors (4×4 or 8×8) for clarity.
+**Source paper.** Ho, Jain, Abbeel (NeurIPS 2020), [arXiv 2006.11239](https://arxiv.org/abs/2006.11239).
 """))
 
 # ============================================================================
-# Setup
+# Section 0: Setup
 # ============================================================================
 cells.append(md("## Setup"))
 cells.append(code("""\
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cpu"   # Math demos are tiny; no GPU needed
-
-# A "fake image" we'll use for visualizations: a small 8x8 RGB pattern
-# (this is intentionally simple so we can see what's happening per pixel).
-x0_demo = torch.linspace(-1, 1, 64, device=DEVICE).view(1, 1, 8, 8).repeat(1, 3, 1, 1)
-x0_demo[:, 0] *= -1   # mirror red channel so we can see channel-specific effects
-print("x0_demo shape:", x0_demo.shape, " range:", (x0_demo.min().item(), x0_demo.max().item()))
+torch.manual_seed(0); np.random.seed(0)
+DEVICE = "cpu"   # everything here is tiny; no GPU needed
 """))
 
 # ============================================================================
-# Section 1: Per-step forward (eq 2)
+# Section 1 — Notation crash course
 # ============================================================================
 cells.append(md(r"""\
-## §2 — Per-step forward transition (Equation 2)
+## Section 1 — Probability notation, demystified
 
-**Paper equation 2** (the per-step transition):
+The DDPM paper uses notation that's standard in probability theory but can feel opaque if you haven't seen it before. Three things to ground:
+
+### 1.1 — A probability distribution is a function, not a number
+
+When the paper writes $q(x_0)$, it does not mean "the value of $q$ at $x_0$." It means **the distribution itself**, viewed as a function that takes any candidate value and returns its probability density.
+
+> Think of $q$ as a function: $q: \mathbb{R}^d \to \mathbb{R}_{\geq 0}$. Plug in any value $x$, get a non-negative number.
+
+For images, $d$ is the number of pixels × channels. For us in this notebook, $d = 2$ — easier to visualize.
+
+The notation $x_0 \sim q(x_0)$ means "$x_0$ is *drawn* (sampled) from the distribution $q$." In code, this is `x_0 = sample(q)`.
+
+### 1.2 — Why the subscript "0" in $x_0$?
+
+The "0" is **a step index in a chain**, not an exponent or a power. The DDPM paper defines a chain of variables:
+
+$$x_0, x_1, x_2, \ldots, x_T$$
+
+- $x_0$ is the **clean original image** (step 0 — no noise added yet).
+- $x_1$ is the same image after one tiny noise step.
+- $x_T$ is the same image after $T$ noise steps — essentially pure noise.
+
+So $q(x_0)$ specifically denotes the distribution of the clean data (step-0 of the chain). $q(x_t)$ would be the distribution of the *noisy* version at step $t$.
+
+### 1.3 — The Gaussian notation $\mathcal{N}(x; \mu, \Sigma)$
+
+For a **scalar (1D)** Gaussian:
+$$\mathcal{N}(x; \mu, \sigma^2) = \frac{1}{\sqrt{2\pi\sigma^2}}\,\exp\!\left(-\frac{(x-\mu)^2}{2\sigma^2}\right)$$
+
+The arguments mean:
+- The first argument $x$ is **where we're evaluating** the density.
+- The second argument $\mu$ is **the mean** (where the distribution is centered).
+- The third argument $\sigma^2$ is **the variance** (how wide the distribution is).
+
+For a **multivariate (vector)** Gaussian:
+$$\mathcal{N}(\mathbf{x}; \boldsymbol{\mu}, \Sigma) = \frac{1}{\sqrt{(2\pi)^d\,|\Sigma|}}\,\exp\!\left(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top \Sigma^{-1} (\mathbf{x}-\boldsymbol{\mu})\right)$$
+
+Now:
+- $\mathbf{x}$ is a $d$-dimensional vector.
+- $\boldsymbol{\mu}$ is also a $d$-dimensional vector (the mean *vector*).
+- $\Sigma$ is a $d \times d$ **covariance matrix** — *not* a single number anymore.
+
+**Why a matrix?** Because for multivariate distributions you have to describe not just how much each dimension varies, but *how dimensions correlate*. The $(i, j)$ entry of $\Sigma$ is the covariance between $x_i$ and $x_j$.
+
+### 1.4 — "Why is the identity matrix a parameter?"
+
+In the paper, equation 2 says:
 
 $$q(x_t \mid x_{t-1}) = \mathcal{N}\!\bigl(x_t;\ \sqrt{1-\beta_t}\,x_{t-1},\ \beta_t I\bigr)$$
 
-To **sample** $x_t$ given $x_{t-1}$ and a noise level $\beta_t$:
+The covariance is $\beta_t I$ where $I$ is the **identity matrix** and $\beta_t$ is a scalar. Concretely for $d = 2$:
 
-$$x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, I)$$
+$$\beta_t I = \beta_t \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix} = \begin{pmatrix} \beta_t & 0 \\ 0 & \beta_t \end{pmatrix}$$
 
-The first term **scales down** the signal; the second term **adds independent Gaussian noise**. The scalars are chosen so that *if* $x_{t-1}$ has unit variance, $x_t$ also has unit variance (variance-preserving Markov chain).
-"""))
+So the covariance matrix is **diagonal** with $\beta_t$ on every diagonal entry. This means **two things at once**:
+1. Each dimension has variance $\beta_t$ (the diagonal entries).
+2. The off-diagonal entries are 0 → **no correlations between dimensions** → noise on each pixel is independent of noise on every other pixel.
 
-cells.append(code("""\
-def per_step_forward(x_prev, beta_t):
-    \"\"\"One forward diffusion step: q(x_t | x_{t-1}).\"\"\"
-    eps = torch.randn_like(x_prev)
-    return torch.sqrt(1 - beta_t) * x_prev + torch.sqrt(beta_t) * eps
+This kind of "diagonal with equal entries" covariance is called **isotropic**. It's the simplest possible noise: independent and equal across every dimension.
 
-# Sanity check: variance preservation
-# Start with unit-variance noise as x_{t-1}; check x_t also has variance ≈ 1.
-torch.manual_seed(0)
-x_prev = torch.randn(10000)   # 10k samples, unit variance
-for beta in [0.001, 0.01, 0.05, 0.1, 0.5]:
-    x_t = per_step_forward(x_prev, torch.tensor(beta))
-    print(f"beta={beta:.3f}   var(x_prev)={x_prev.var().item():.4f}   var(x_t)={x_t.var().item():.4f}   "
-          f"(theory: variance preserved if x_prev has var 1)")
-"""))
+For images, "isotropic" means **every pixel gets its own independent Gaussian noise sample, all with the same variance**. Very different from, say, blurring (which would correlate neighboring pixels — represented by a non-diagonal $\Sigma$).
 
-cells.append(md("""\
-The variance stays at ~1.0 regardless of $\\beta_t$. That's the *variance-preserving* property. Important: it's why we can chain 1000 of these steps and still have $x_T$ on the same scale as $x_0$ rather than blowing up to infinity.
+So when the paper writes "$\Sigma = \beta_t I$," it's not a strange parameter — it's just shorthand for "independent Gaussian noise of the same variance on every dimension." We'll visualize this on 2D data below.
+
+### 1.5 — $q$ vs $p_\theta$
+
+Just a naming convention:
+- $q$ = the **true** distribution (data, forward process). Unknown explicitly — we only have samples.
+- $p_\theta$ = our **model**, parameterized by neural network weights $\theta$. We can evaluate and sample it.
+
+That's it. They're both probability distributions; we just use different symbols to keep track of which is the *target* (data) and which is the *model* we're training.
 """))
 
 # ============================================================================
-# Section 2: Closed-form forward (eq 4)
+# Section 2 — Visualize the data distribution
 # ============================================================================
 cells.append(md(r"""\
-## §2 — Closed-form forward from $x_0$ to $x_t$ (Equation 4)
+## Section 2 — Visualize $q(x_0)$ as 2D spiral data
 
-**Paper equation 4** uses the abbreviations:
-$$\alpha_t := 1 - \beta_t, \qquad \bar\alpha_t := \prod_{s=1}^{t} \alpha_s$$
+To *see* every concept in this paper, we replace high-dimensional images with **2D toy data**. We pick a spiral shape: each "data point" is a 2D vector $x = (x_1, x_2) \in \mathbb{R}^2$. The distribution $q(x_0)$ is then a 2D scatter cloud shaped like a spiral.
 
-and states:
+This serves the same role as a high-resolution image dataset, but small enough to plot.
+"""))
+cells.append(code("""\
+def make_spiral(n=1000, noise=0.05):
+    \"\"\"2D spiral data. n points, with a small bit of noise so the spiral has thickness.\"\"\"
+    theta = torch.linspace(0, 4 * math.pi, n)
+    r = theta / (4 * math.pi)                  # radius grows with theta
+    x = r * torch.cos(theta) + noise * torch.randn(n)
+    y = r * torch.sin(theta) + noise * torch.randn(n)
+    return torch.stack([x, y], dim=1) * 2.0    # scale to make it visible
 
+torch.manual_seed(0)
+x0_data = make_spiral(2000)
+print(f"x0_data: shape={x0_data.shape} (2000 points, 2 dims)  range=[{x0_data.min():.2f}, {x0_data.max():.2f}]")
+
+fig, ax = plt.subplots(figsize=(5, 5))
+ax.scatter(x0_data[:, 0], x0_data[:, 1], s=4, alpha=0.5)
+ax.set_title(r"$q(x_0)$ — our 2D 'image' data, a spiral")
+ax.set_aspect("equal"); ax.grid(alpha=0.3); ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5)
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md("""\
+Each dot is one "data sample" $x_0$. The whole cloud, taken together, *is* the distribution $q(x_0)$ — a probability distribution that gives high density to points on the spiral and near-zero density everywhere else. We never have $q$ as an explicit function; we only have these samples (just like we only have CIFAR-10 images, not the equations behind them).
+"""))
+
+# ============================================================================
+# Section 3 — Visualize "isotropic Gaussian noise"
+# ============================================================================
+cells.append(md(r"""\
+## Section 3 — What does $\mathcal{N}(0, I)$ look like in 2D?
+
+Before we touch the forward process, let's see what "isotropic Gaussian noise" actually looks like — the building block of all the noising operations.
+
+For a 2D vector $\varepsilon \sim \mathcal{N}(0, I)$ where $I = \begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix}$:
+- The mean is $(0, 0)$ — centered at the origin.
+- The covariance is $I$ — variance 1 in each dimension, no correlation between dimensions.
+
+In code: just `torch.randn(N, 2)`. Each dimension is independently sampled from a standard Gaussian.
+"""))
+cells.append(code("""\
+torch.manual_seed(0)
+eps_samples = torch.randn(2000, 2)
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+axes[0].scatter(eps_samples[:, 0], eps_samples[:, 1], s=4, alpha=0.5)
+axes[0].set_title(r"$\\varepsilon \\sim \\mathcal{N}(0, I)$ — isotropic 2D Gaussian noise")
+axes[0].set_aspect("equal"); axes[0].set_xlim(-4, 4); axes[0].set_ylim(-4, 4)
+axes[0].axhline(0, color='gray', alpha=0.3); axes[0].axvline(0, color='gray', alpha=0.3)
+
+axes[1].hist(eps_samples[:, 0].numpy(), bins=40, color="tab:blue", alpha=0.7)
+axes[1].set_title(r"marginal of dim 0: $\\varepsilon_0 \\sim \\mathcal{N}(0, 1)$")
+axes[1].set_xlabel("value"); axes[1].set_ylabel("count")
+
+axes[2].hist(eps_samples[:, 1].numpy(), bins=40, color="tab:orange", alpha=0.7)
+axes[2].set_title(r"marginal of dim 1: $\\varepsilon_1 \\sim \\mathcal{N}(0, 1)$")
+axes[2].set_xlabel("value"); axes[2].set_ylabel("count")
+plt.tight_layout(); plt.show()
+
+# Sanity checks
+print(f"per-dim mean:     {eps_samples.mean(0).numpy()}     (expected: [0, 0])")
+print(f"per-dim variance: {eps_samples.var(0).numpy()}      (expected: [1, 1])")
+print(f"covariance (off-diagonal): {torch.cov(eps_samples.T)[0, 1].item():.4f}   (expected: 0)")
+"""))
+cells.append(md(r"""\
+Read the plot top-to-bottom:
+- Left: a blob centered at $(0, 0)$ with circular symmetry. The circular shape is because covariance is the *identity matrix* (same variance in both dimensions, no correlation).
+- Middle / right: each dimension by itself is a standard Gaussian.
+
+If the covariance had been, say, $\begin{pmatrix} 4 & 0 \\ 0 & 0.25 \end{pmatrix}$, the blob would have been wide in $x$ and narrow in $y$ — an ellipse, not a circle. The "isotropic" in $\mathcal{N}(0, \sigma^2 I)$ just means "same in every direction."
+
+**This is the noise we add at every forward step in DDPM.** When the paper says "$\beta_t I$" — it just means this same blob, scaled by $\sqrt{\beta_t}$.
+"""))
+
+# ============================================================================
+# Section 4 — The per-step forward, visualized on 2D
+# ============================================================================
+cells.append(md(r"""\
+## Section 4 — Per-step forward $q(x_t \mid x_{t-1})$, visualized
+
+Paper equation 2:
+
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\bigl(x_t;\ \sqrt{1-\beta_t}\,x_{t-1},\ \beta_t I\bigr)$$
+
+In sampling form:
+$$x_t = \underbrace{\sqrt{1-\beta_t}}_{\text{shrink}}\,x_{t-1} + \underbrace{\sqrt{\beta_t}\,\varepsilon}_{\text{add noise}}, \qquad \varepsilon \sim \mathcal{N}(0, I)$$
+
+Two operations per step:
+- **Shrink:** multiply $x_{t-1}$ by $\sqrt{1-\beta_t} < 1$. Pulls the data toward 0.
+- **Add isotropic noise:** add $\sqrt{\beta_t}\,\varepsilon$.
+
+Watch this happen on the spiral with $\beta = 0.05$ (one big step, exaggerated for visibility).
+"""))
+cells.append(code("""\
+def per_step_forward(x_prev, beta):
+    eps = torch.randn_like(x_prev)
+    return torch.sqrt(1 - beta) * x_prev + torch.sqrt(beta) * eps
+
+torch.manual_seed(0)
+beta_demo = torch.tensor(0.05)            # large beta to make the change visible
+
+x0 = x0_data
+x_shrunk = torch.sqrt(1 - beta_demo) * x0  # shrink only (no noise)
+x1 = per_step_forward(x0, beta_demo)      # full forward step
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].scatter(x0[:, 0], x0[:, 1], s=4, alpha=0.5)
+axes[0].set_title(r"$x_0$ — original data");           axes[0].set_aspect("equal"); axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5)
+
+axes[1].scatter(x_shrunk[:, 0], x_shrunk[:, 1], s=4, alpha=0.5)
+axes[1].set_title(r"$\\sqrt{1-\\beta}\\,x_0$ — just shrink (no noise)"); axes[1].set_aspect("equal"); axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5)
+
+axes[2].scatter(x1[:, 0], x1[:, 1], s=4, alpha=0.5)
+axes[2].set_title(r"$x_1$ — after shrink + noise (full forward step)"); axes[2].set_aspect("equal"); axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5)
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+The middle plot shows the spiral **slightly contracted** toward the origin (because $\sqrt{1-0.05} \approx 0.975 < 1$). The right plot adds the noise — the spiral becomes a "fuzzy spiral." After many such steps the structure disappears entirely.
+
+### Why this specific shrink-then-noise form? Variance preservation.
+
+Claim: if $x_{t-1}$ has variance 1 (unit-variance data), then $x_t$ also has variance 1. This is why the chain doesn't explode in magnitude or collapse to zero.
+
+**Proof on paper (write this with me):**
+- $x_t = \sqrt{1 - \beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\varepsilon$
+- Take variance of both sides. Variance is additive for independent terms.
+- $\text{Var}(x_t) = (\sqrt{1-\beta_t})^2 \cdot \text{Var}(x_{t-1}) + (\sqrt{\beta_t})^2 \cdot \text{Var}(\varepsilon)$
+- $= (1-\beta_t) \cdot 1 + \beta_t \cdot 1 = 1$
+
+Verify numerically below — should print near 1.0 for any $\beta$.
+"""))
+cells.append(code("""\
+torch.manual_seed(0)
+x_prev_test = torch.randn(50_000, 2)    # unit-variance start
+for beta in [0.001, 0.01, 0.1, 0.5]:
+    x_t_test = per_step_forward(x_prev_test, torch.tensor(beta))
+    print(f"beta={beta:.3f}   var(x_prev)={x_prev_test.var().item():.4f}   "
+          f"var(x_t)={x_t_test.var().item():.4f}   (theory: 1.0)")
+"""))
+
+# ============================================================================
+# Section 5 — The full forward chain on the spiral
+# ============================================================================
+cells.append(md(r"""\
+## Section 5 — Watch the spiral dissolve into noise
+
+Now run the full forward process: $T = 1000$ steps with the linear schedule $\beta_1 = 10^{-4}$ to $\beta_T = 0.02$. We snapshot the data at several timesteps.
+
+**What you're watching:** at each $t$, a different "noised version" of the spiral. The visible structure dissolves; by $t = T$ it should be indistinguishable from $\mathcal{N}(0, I)$ — a circular blob.
+"""))
+cells.append(code("""\
+T = 1000
+betas = torch.linspace(1e-4, 2e-2, T)
+alphas = 1 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)
+
+# Iterate the full forward chain. Save snapshots at several t.
+torch.manual_seed(0)
+snapshots = {}
+snapshot_t = [0, 50, 200, 500, 800, 999]
+x = x0_data.clone()
+for t in range(T):
+    if t in snapshot_t:
+        snapshots[t] = x.clone()
+    x = per_step_forward(x, betas[t])
+snapshots[T-1] = x.clone()
+
+fig, axes = plt.subplots(1, len(snapshot_t), figsize=(3 * len(snapshot_t), 3))
+for ax, t in zip(axes, snapshot_t):
+    s = snapshots[t]
+    ax.scatter(s[:, 0], s[:, 1], s=3, alpha=0.5)
+    ax.set_title(f"t = {t}\\n" + r"$\\bar\\alpha_t$" + f" = {alpha_bars[t].item():.3f}")
+    ax.set_aspect("equal"); ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+What you're seeing:
+
+- **$t = 0$**: pristine spiral, $\bar\alpha_t \approx 1$ (full signal).
+- **$t = 50$**: still a spiral, just slightly noisier. $\bar\alpha_t \approx 0.995$.
+- **$t = 200$**: spiral still visible but blurred. $\bar\alpha_t \approx 0.7$.
+- **$t = 500$**: shape mostly gone. $\bar\alpha_t \approx 0.05$.
+- **$t = 800$, $t = 999$**: roughly circular blob, basically standard Gaussian.
+
+The signal scale $\bar\alpha_t$ printed in each title tracks exactly what fraction of the original data remains. By $t = 999$ it's near zero — pure noise.
+"""))
+
+# ============================================================================
+# Section 6 — Closed-form forward, on the spiral
+# ============================================================================
+cells.append(md(r"""\
+## Section 6 — The closed-form forward (paper equation 4), visualized
+
+The big trick: instead of iterating $t$ steps to get $x_t$ from $x_0$, sample directly in one shot.
+
+Paper equation 4:
 $$q(x_t \mid x_0) = \mathcal{N}\!\bigl(x_t;\ \sqrt{\bar\alpha_t}\,x_0,\ (1 - \bar\alpha_t)\,I\bigr)$$
 
-To sample $x_t$ in **one step** (no Markov chain needed):
-
+Sample form:
 $$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, I)$$
+
+This has the **same shape** as one forward step (shrink + add isotropic noise) but with **cumulative coefficients**:
+- $\sqrt{\bar\alpha_t}$ in place of $\sqrt{1-\beta_t}$ — the cumulative shrink.
+- $\sqrt{1 - \bar\alpha_t}$ in place of $\sqrt{\beta_t}$ — the cumulative noise.
+
+**Verify on plot:** generate $x_t$ at the same timesteps using the closed form, and compare to the iterative snapshots. They should look statistically the same.
 """))
-
 cells.append(code("""\
-def linear_beta_schedule(T, beta_start=1e-4, beta_end=2e-2):
-    \"\"\"Paper §4: linear from 1e-4 to 2e-2 over T=1000 steps.\"\"\"
-    return torch.linspace(beta_start, beta_end, T, device=DEVICE)
-
-def get_alphas_cumprod(betas):
-    alphas = 1.0 - betas
-    return torch.cumprod(alphas, dim=0)
-
-def q_sample(x0, t, alpha_bars):
-    \"\"\"Closed-form: x_t = sqrt(ab_t) * x_0 + sqrt(1 - ab_t) * eps.\"\"\"
-    ab = alpha_bars[t]                                        # shape: (B,) or scalar
-    while ab.dim() < x0.dim():
-        ab = ab.unsqueeze(-1)
+def q_sample(x0, t):
+    \"\"\"Equation 4: closed-form sample x_t from x_0 in one shot.\"\"\"
+    ab = alpha_bars[t]
     eps = torch.randn_like(x0)
-    return ab.sqrt() * x0 + (1 - ab).sqrt() * eps, eps
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * eps
 
-T = 1000
-betas = linear_beta_schedule(T)
-alpha_bars = get_alphas_cumprod(betas)
-print(f"alpha_bars[0]   = {alpha_bars[0].item():.6f}    (near 1, signal preserved)")
-print(f"alpha_bars[500] = {alpha_bars[500].item():.6f}   (signal partly destroyed)")
-print(f"alpha_bars[999] = {alpha_bars[-1].item():.2e}    (near 0, signal gone)")
-"""))
-
-cells.append(md("""\
-### Numerical check — iterative vs closed-form should match
-
-Claim: iterating Equation 2 forward $t$ times produces the same *distribution* as the one-step closed-form Equation 4. We verify by checking that **the mean and variance match across 50,000 samples**.
-"""))
-cells.append(code("""\
-def iterative_forward(x0, t, betas):
-    \"\"\"Apply per-step forward t times (a literal Markov-chain simulation).\"\"\"
-    x = x0.clone()
-    for s in range(t):
-        x = per_step_forward(x, betas[s])
-    return x
-
-# Start with a fixed value to make the moment estimates easy to read
-N = 50_000
-x0 = torch.full((N,), 0.5, device=DEVICE)
-
-for t_check in [10, 100, 500, 999]:
-    torch.manual_seed(0)
-    x_iter = iterative_forward(x0, t_check, betas)
-    torch.manual_seed(0)
-    x_closed, _ = q_sample(x0, torch.tensor([t_check]).expand(N), alpha_bars)
-    ab_t = alpha_bars[t_check]
-    theory_mean = (ab_t.sqrt() * 0.5).item()
-    theory_std  = (1 - ab_t).sqrt().item()
-    print(f"t={t_check:3d}   iterative:  mean={x_iter.mean().item():+.4f}  std={x_iter.std().item():.4f}")
-    print(f"          closed-form: mean={x_closed.mean().item():+.4f}  std={x_closed.std().item():.4f}")
-    print(f"          theory:      mean={theory_mean:+.4f}  std={theory_std:.4f}\\n")
-"""))
-
-cells.append(md("""\
-All three numbers agree to ~2 decimal places at every tested $t$ (the tiny disagreement is Monte Carlo error from finite samples). **The closed form is exact, not an approximation** — but it's *vastly* cheaper than iterating: one tensor op vs $t$ loop iterations.
-
-This is the trick that makes DDPM training tractable. Without it, every gradient step would have to simulate hundreds of forward steps.
-"""))
-
-# ============================================================================
-# Section 3: Visualize forward process
-# ============================================================================
-cells.append(md("""\
-## §2 — Visualize forward process on a real image
-
-Apply Equation 4 at several $t$ values to a small image. By $t = 999$ the image is indistinguishable from pure Gaussian noise; intermediate $t$ values show the gradient between signal and noise.
-"""))
-cells.append(code("""\
 torch.manual_seed(0)
-t_vis = [0, 100, 250, 500, 750, 999]
-rows = []
-for t in t_vis:
-    x_t, _ = q_sample(x0_demo, torch.tensor([t]), alpha_bars)
-    rows.append(x_t)
-panel = torch.cat(rows, dim=0)
+fig, axes = plt.subplots(2, len(snapshot_t), figsize=(3 * len(snapshot_t), 6))
+for col, t in enumerate(snapshot_t):
+    # Iterative (top row)
+    axes[0, col].scatter(snapshots[t][:, 0], snapshots[t][:, 1], s=3, alpha=0.5, c="tab:blue")
+    axes[0, col].set_title(f"iterative, t={t}")
+    axes[0, col].set_aspect("equal"); axes[0, col].set_xlim(-2.5, 2.5); axes[0, col].set_ylim(-2.5, 2.5)
+    axes[0, col].set_xticks([]); axes[0, col].set_yticks([])
 
-fig, axes = plt.subplots(1, len(t_vis), figsize=(2 * len(t_vis), 2.2))
-for ax, x, t in zip(axes, panel, t_vis):
-    img = (x.clamp(-1, 1) + 1) / 2          # to [0, 1]
-    ax.imshow(img.permute(1, 2, 0))
-    ax.set_title(f"t={t}\\nstd={x.std().item():.2f}")
-    ax.axis("off")
+    # Closed-form (bottom row)
+    x_t_closed = q_sample(x0_data, t)
+    axes[1, col].scatter(x_t_closed[:, 0], x_t_closed[:, 1], s=3, alpha=0.5, c="tab:orange")
+    axes[1, col].set_title(f"closed-form, t={t}")
+    axes[1, col].set_aspect("equal"); axes[1, col].set_xlim(-2.5, 2.5); axes[1, col].set_ylim(-2.5, 2.5)
+    axes[1, col].set_xticks([]); axes[1, col].set_yticks([])
+
+plt.suptitle("Iterative (top) vs closed-form (bottom) — same distribution at each t", y=1.02)
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+Row 1 (blue, iterative) and Row 2 (orange, closed-form) are visually indistinguishable at every $t$. The distributions are identical — the closed form is *exact*, not an approximation.
+
+**Pen-and-paper exercise.** Re-derive equation 4 from equation 2:
+1. Write $x_1 = \sqrt{\alpha_1}\,x_0 + \sqrt{1-\alpha_1}\,\varepsilon_1$ (where $\alpha_t := 1-\beta_t$).
+2. Substitute into $x_2 = \sqrt{\alpha_2}\,x_1 + \sqrt{1-\alpha_2}\,\varepsilon_2$.
+3. Use the fact that **a sum of independent Gaussians is Gaussian** (with variances summing) to collapse the noise terms.
+4. Generalize by induction: $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\bar\varepsilon$.
+
+This is the heart of Step 3 in the tutorial markdown. The visual above is the *empirical* confirmation that the algebra was right.
+"""))
+
+# ============================================================================
+# Section 7 — Per-pixel intuition for "isotropic noise"
+# ============================================================================
+cells.append(md(r"""\
+## Section 7 — Why "isotropic noise" matters: tracing a single point
+
+A subtle point that often confuses people: the noise added at each step is **independent per dimension and per sample**. To make this concrete, take *one* data point from the spiral and watch its trajectory across many noise samples.
+"""))
+cells.append(code("""\
+# Pick one spiral point, e.g., near (1, 0)
+x0_single = torch.tensor([[1.0, 0.0]])
+
+# Generate 100 different noise realizations of the same point, forward to t=500
+t_show = 500
+torch.manual_seed(0)
+samples = torch.cat([q_sample(x0_single, t_show) for _ in range(100)], dim=0)
+
+# Compare to all spiral points forwarded once
+torch.manual_seed(1)
+all_spiral_at_t = q_sample(x0_data, t_show)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+axes[0].scatter(all_spiral_at_t[:, 0], all_spiral_at_t[:, 1], s=2, alpha=0.2, c="lightgray", label="all spiral points")
+axes[0].scatter(samples[:, 0], samples[:, 1], s=15, alpha=0.7, c="red", label="100 noise samples\\nof one point (1,0)")
+axes[0].scatter(*x0_single[0].tolist(), s=200, c="black", marker="*", label="original (1, 0)")
+axes[0].set_title(f"100 noise realizations of one spiral point at t={t_show}")
+axes[0].set_aspect("equal"); axes[0].set_xlim(-3, 3); axes[0].set_ylim(-3, 3); axes[0].legend(loc="upper right"); axes[0].grid(alpha=0.3)
+
+# Distribution of noise samples should be a Gaussian centered near sqrt(ab_t) * (1,0)
+ab_t = alpha_bars[t_show]
+center = (ab_t.sqrt() * x0_single)[0]
+expected_std = (1 - ab_t).sqrt().item()
+axes[1].scatter(samples[:, 0], samples[:, 1], s=15, c="red", alpha=0.7)
+# Draw the 1-sigma and 2-sigma circles
+for r, label in [(expected_std, '1σ'), (2 * expected_std, '2σ')]:
+    theta = np.linspace(0, 2 * np.pi, 100)
+    axes[1].plot(center[0] + r * np.cos(theta), center[1] + r * np.sin(theta), 'b--', alpha=0.5, label=label)
+axes[1].scatter(*center.tolist(), s=200, c="blue", marker="x", label=r"predicted mean: $\\sqrt{\\bar\\alpha_t}\\,(1,0)$")
+axes[1].set_title(f"Same data with theoretical mean and std ranges\\n(σ = {expected_std:.3f})")
+axes[1].set_aspect("equal"); axes[1].legend(loc="upper right"); axes[1].grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+What this plot shows:
+- Each red dot is one noise realization of the same starting point $(1, 0)$.
+- The 100 red dots form a **circular cloud** centered near $\sqrt{\bar\alpha_t}\,(1, 0)$ with radius $\sqrt{1-\bar\alpha_t}$.
+- The blue dashed circles are the predicted 1σ and 2σ contours from theory.
+
+Roughly 68% of red dots should fall inside the 1σ circle, ~95% inside 2σ — the standard Gaussian rule. The cloud is **circular** because the covariance is $\beta_t I$ (isotropic). If the noise were not isotropic, the cloud would be an ellipse.
+
+This is the operational meaning of "$q(x_t \mid x_0) = \mathcal{N}(\cdot, \beta_t I)$": for a fixed $x_0$, the noise added in each direction is *independent* and *equal in magnitude*, producing a circular cloud of possible $x_t$ values.
+"""))
+
+# ============================================================================
+# Section 8 — Train a small reverse model
+# ============================================================================
+cells.append(md(r"""\
+## Section 8 — Train a tiny reverse model (so we can see backward diffusion)
+
+So far the forward process is fixed — we *defined* it. The reverse process needs to be **learned**. Train a tiny 2-input → 2-output MLP that takes $(x_t, t)$ and predicts the noise $\varepsilon$ that was added. This is the $\varepsilon_\theta(x_t, t)$ from the paper, but tiny enough to train on a CPU in seconds.
+
+The architecture: 2D input + 64-dim sinusoidal time embedding → MLP → 2D output (predicted ε).
+"""))
+cells.append(code("""\
+class SinusoidalTimeEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__(); self.dim = dim
+    def forward(self, t):
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half) / (half - 1))
+        args = t.float()[:, None] * freqs[None]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+class ToyMLP(nn.Module):
+    def __init__(self, hidden=128, t_dim=64):
+        super().__init__()
+        self.t_emb = SinusoidalTimeEmb(t_dim)
+        self.net = nn.Sequential(
+            nn.Linear(2 + t_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2),                  # output: predicted epsilon
+        )
+    def forward(self, x, t):
+        h = torch.cat([x, self.t_emb(t)], dim=-1)
+        return self.net(h)
+
+torch.manual_seed(0)
+model = ToyMLP().to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"ToyMLP params: {n_params:,}")
+"""))
+
+cells.append(code("""\
+# Train on the spiral
+optim = torch.optim.Adam(model.parameters(), lr=2e-3)
+losses = []
+torch.manual_seed(0)
+for step in range(8000):
+    # Pick a random batch from the spiral
+    idx = torch.randint(0, len(x0_data), (256,))
+    x0_batch = x0_data[idx]
+    # Pick random timesteps
+    t = torch.randint(0, T, (256,))
+    # Sample x_t and remember the true noise
+    eps = torch.randn_like(x0_batch)
+    ab = alpha_bars[t].unsqueeze(-1)
+    x_t = ab.sqrt() * x0_batch + (1 - ab).sqrt() * eps
+    # Predict the noise
+    eps_pred = model(x_t, t)
+    loss = F.mse_loss(eps_pred, eps)
+    optim.zero_grad(); loss.backward(); optim.step()
+    losses.append(loss.item())
+    if step % 1000 == 0:
+        print(f"step {step:4d}  loss={loss.item():.4f}")
+
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.plot(losses); ax.set_yscale("log"); ax.set_xlabel("step"); ax.set_ylabel("MSE on noise")
+ax.set_title("Toy MLP training loss"); plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+Loss drops from ~1.0 (random init, MSE between two unit-variance vectors is ~1+1=2 expected, single direction ~1) toward ~0.05. The model is learning to predict the noise direction given any noised spiral point.
+"""))
+
+# ============================================================================
+# Section 9 — Sample from the trained model
+# ============================================================================
+cells.append(md(r"""\
+## Section 9 — Sampling: watch the spiral *re-emerge* from noise
+
+Now run Algorithm 2 from the paper: start from $x_T \sim \mathcal{N}(0, I)$ and apply the learned reverse step $T$ times. We snapshot the cloud at intermediate timesteps to *see* the noise turn into a spiral.
+
+**Reverse step formula (paper equation 11):**
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\varepsilon_\theta(x_t, t)\right) + \sigma_t\,z, \qquad z \sim \mathcal{N}(0, I) \text{ if } t > 1$$
+
+In words: at each step, predict the noise, subtract a scaled version of it from $x_t$, divide by the signal-shrink factor, then add a tiny bit of stochastic noise.
+"""))
+cells.append(code("""\
+@torch.no_grad()
+def sample_with_trace(model, n_samples=2000, trace_at=[999, 800, 500, 200, 50, 0]):
+    \"\"\"Algorithm 2 from the paper, with snapshots saved at requested timesteps.\"\"\"
+    model.eval()
+    x = torch.randn(n_samples, 2)
+    snapshots = {}
+    for t in reversed(range(T)):
+        t_batch = torch.full((n_samples,), t, dtype=torch.long)
+        eps_pred = model(x, t_batch)
+        ab_t = alpha_bars[t]
+        a_t  = alphas[t]
+        b_t  = betas[t]
+        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()
+        if t > 0:
+            x = mean + b_t.sqrt() * torch.randn_like(x)
+        else:
+            x = mean
+        if t in trace_at:
+            snapshots[t] = x.clone()
+    return snapshots
+
+snapshots_rev = sample_with_trace(model)
+trace_at = [999, 800, 500, 200, 50, 0]
+
+fig, axes = plt.subplots(1, len(trace_at), figsize=(3 * len(trace_at), 3))
+for ax, t in zip(axes, trace_at):
+    s = snapshots_rev[t]
+    ax.scatter(s[:, 0], s[:, 1], s=3, alpha=0.5, c="tab:green")
+    ax.set_title(f"reverse step at t = {t}")
+    ax.set_aspect("equal"); ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+Reading left-to-right (the time direction of the **reverse** process):
+
+- **$t = 999$**: noise blob (initial state — pure Gaussian).
+- **$t = 800$**: still mostly noise, but starting to coalesce.
+- **$t = 500$**: structure visible.
+- **$t = 200$**: looks like a spiral.
+- **$t = 50, 0$**: sharp spiral, matches the training distribution.
+
+This is what the DDPM reverse process *does* — guides random noise back to the data distribution. The trained MLP has implicitly learned the data manifold and produces samples that lie on it.
+
+Compare side-by-side: the original training data (left), the model's samples (middle), and pure Gaussian noise for reference (right).
+"""))
+cells.append(code("""\
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].scatter(x0_data[:, 0], x0_data[:, 1], s=4, alpha=0.5, c="tab:blue")
+axes[0].set_title("training data $q(x_0)$"); axes[0].set_aspect("equal"); axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5)
+
+axes[1].scatter(snapshots_rev[0][:, 0], snapshots_rev[0][:, 1], s=4, alpha=0.5, c="tab:green")
+axes[1].set_title("model samples $p_\\\\theta(x_0)$"); axes[1].set_aspect("equal"); axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5)
+
+axes[2].scatter(snapshots_rev[999][:, 0], snapshots_rev[999][:, 1], s=4, alpha=0.5, c="tab:gray")
+axes[2].set_title("starting noise $x_T \\\\sim \\\\mathcal{N}(0, I)$"); axes[2].set_aspect("equal"); axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5)
 plt.tight_layout(); plt.show()
 """))
 
 # ============================================================================
-# Section 4: Plot the schedule
+# Section 10 — Visualize the score field (epsilon prediction)
 # ============================================================================
-cells.append(md("""\
-## §2 — The β schedule, plotted
+cells.append(md(r"""\
+## Section 10 — Visualize the score field
 
-Paper §4 uses a **linear** schedule from $\\beta_1 = 10^{-4}$ to $\\beta_T = 0.02$. Three curves matter:
-- $\\beta_t$ — per-step noise added (small, growing linearly).
-- $\\bar\\alpha_t$ — signal scale (cumulative product of $1-\\beta$, decreasing from 1 to ~0).
-- log signal-to-noise ratio $\\log(\\bar\\alpha_t / (1-\\bar\\alpha_t))$ — when positive, signal dominates; when negative, noise dominates.
+The model predicts $\varepsilon_\theta(x_t, t)$ at every point in space. This prediction has a **geometric interpretation**: it points *toward more noise*, so $-\varepsilon_\theta$ points *toward the data*. Visualize this as an arrow field.
+
+We evaluate $\varepsilon_\theta$ on a grid of $(x, y)$ points at a moderate timestep ($t = 500$ — halfway between data and pure noise) and plot the negative prediction (so arrows point toward the data manifold).
 """))
 cells.append(code("""\
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-axes[0].plot(betas.numpy()); axes[0].set_title(r"$\\beta_t$"); axes[0].set_xlabel("t"); axes[0].set_yscale("log")
-axes[1].plot(alpha_bars.numpy()); axes[1].set_title(r"$\\bar\\alpha_t$"); axes[1].set_xlabel("t")
-log_snr = (alpha_bars / (1 - alpha_bars + 1e-12)).log().numpy()
-axes[2].plot(log_snr); axes[2].set_title(r"$\\log(\\bar\\alpha_t / (1-\\bar\\alpha_t))$ — log SNR")
-axes[2].axhline(0, ls="--", c="gray", label="signal = noise"); axes[2].legend(); axes[2].set_xlabel("t")
+# Build a grid in 2D
+grid_x, grid_y = torch.meshgrid(torch.linspace(-2.5, 2.5, 20), torch.linspace(-2.5, 2.5, 20), indexing="xy")
+grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
+
+t_score = 500
+t_batch = torch.full((grid.shape[0],), t_score, dtype=torch.long)
+model.eval()
+with torch.no_grad():
+    eps_field = model(grid, t_batch)
+
+# Plot: -eps_field arrows on top of the noisy data at this t
+torch.manual_seed(0)
+noisy_data = q_sample(x0_data, t_score)
+
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(noisy_data[:, 0], noisy_data[:, 1], s=3, alpha=0.3, c="tab:gray", label=f"q(x_{t_score})")
+ax.quiver(grid[:, 0], grid[:, 1], -eps_field[:, 0], -eps_field[:, 1],
+          angles="xy", scale_units="xy", scale=10, alpha=0.7, color="tab:red")
+ax.set_title(f"Negative noise prediction (red arrows) at t = {t_score}\\n"
+             f"arrows point toward the data manifold; gray = noisy data q(x_{t_score})")
+ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_aspect("equal"); ax.grid(alpha=0.3); ax.legend()
 plt.tight_layout(); plt.show()
-print("crossover (signal = noise) at t ≈", (log_snr > 0).sum())
+"""))
+cells.append(md(r"""\
+The red arrows point in the direction of $-\varepsilon_\theta(x_t, t)$ — the direction to move a noisy point to **reduce noise** at this timestep. They should roughly point toward the spiral curve.
+
+This is **exactly the score function** $\nabla_x \log p_t(x)$ for the noised distribution — up to a known scalar — and explains the deep connection between DDPM ε-prediction and score-based generative modeling (Yang Song 2019). The sampling process "follows the score": at each step, take a small step in the direction that increases data likelihood, then add a bit of noise for randomness.
 """))
 
 # ============================================================================
-# Section 5: Reverse process structure
+# Section 11 — KL between Gaussians, visualized
 # ============================================================================
 cells.append(md(r"""\
-## §2 — Reverse process structure (Equation 1)
+## Section 11 — What is KL divergence, intuitively?
 
-**Paper equation 1** (the joint and per-step reverse):
+The training objective in DDPM involves the **KL divergence** between two Gaussian distributions. KL is a *measure of how different two distributions are*. Two distributions identical → KL = 0. Very different → KL is large.
 
-$$p_\theta(x_{0:T}) := p(x_T)\,\prod_{t=1}^{T} p_\theta(x_{t-1} \mid x_t), \qquad p_\theta(x_{t-1} \mid x_t) := \mathcal{N}\!\bigl(x_{t-1};\ \mu_\theta(x_t, t),\ \Sigma_\theta(x_t, t)\bigr)$$
+For two 1D Gaussians $\mathcal{N}(\mu_1, \sigma_1^2)$ and $\mathcal{N}(\mu_2, \sigma_2^2)$:
+$$D_{KL}(p \,\|\, q) = \log\frac{\sigma_2}{\sigma_1} + \frac{\sigma_1^2 + (\mu_1 - \mu_2)^2}{2\sigma_2^2} - \frac{1}{2}$$
 
-The neural network outputs the **mean** $\mu_\theta(x_t, t)$ and **covariance** $\Sigma_\theta(x_t, t)$. To generate, start at $x_T \sim \mathcal{N}(0, I)$ and sample iteratively. Here we stub the model with a *fake* mean/variance to show the *shape* of one reverse step — the actual μ/Σ come from a trained network (see `day2/day2_diffusion.ipynb` for the full thing).
+Visualize this for several cases.
 """))
 cells.append(code("""\
-def one_reverse_step(x_t, mu_theta, sigma_theta, t):
-    \"\"\"Sample x_{t-1} from N(mu_theta, sigma_theta^2 I). t=0 is a special case: no noise.\"\"\"
-    if t == 0:
-        return mu_theta
-    noise = torch.randn_like(x_t)
-    return mu_theta + sigma_theta * noise
+def kl_normal(mu1, s1, mu2, s2):
+    return math.log(s2 / s1) + (s1**2 + (mu1 - mu2)**2) / (2 * s2**2) - 0.5
 
-# Stub: assume the network just outputs x_t scaled by 0.9 (no learning, just shape check).
-x_T = torch.randn(1, 3, 8, 8, device=DEVICE)
-print(f"x_T (initial noise): shape={x_T.shape}  std={x_T.std().item():.3f}")
-
-x = x_T.clone()
-for t in reversed(range(5)):  # only 5 steps for a shape check
-    mu = 0.9 * x                          # placeholder for mu_theta(x_t, t)
-    sigma = torch.tensor(0.1)             # placeholder for sigma_theta
-    x = one_reverse_step(x, mu, sigma, t)
-
-print(f"after 5 reverse steps: shape={x.shape}  std={x.std().item():.3f}")
-print("(values are meaningless without a trained model -- just verifying the loop runs)")
-"""))
-
-# ============================================================================
-# Section 6: Variational bound and KL between Gaussians
-# ============================================================================
-cells.append(md(r"""\
-## §2 — Variational bound (Equation 5) — and the KL between two Gaussians
-
-Paper equation 5 (the bound, in three pieces):
-
-$$L = \underbrace{D_{\mathrm{KL}}(q(x_T \mid x_0) \,\|\, p(x_T))}_{L_T} + \sum_{t > 1} \underbrace{D_{\mathrm{KL}}(q(x_{t-1} \mid x_t, x_0) \,\|\, p_\theta(x_{t-1} \mid x_t))}_{L_{t-1}} - \underbrace{\log p_\theta(x_0 \mid x_1)}_{L_0}$$
-
-Each $L_{t-1}$ is a **KL between two Gaussians**, which has a closed-form expression (no Monte Carlo). Verify the closed form against an MC estimate to make this concrete.
-
-For two univariate Gaussians $\mathcal{N}(\mu_1, \sigma_1^2)$ and $\mathcal{N}(\mu_2, \sigma_2^2)$:
-
-$$D_{\mathrm{KL}}(p \,\|\, q) = \log\frac{\sigma_2}{\sigma_1} + \frac{\sigma_1^2 + (\mu_1 - \mu_2)^2}{2\sigma_2^2} - \frac{1}{2}$$
-"""))
-cells.append(code("""\
-def kl_gaussian_closed_form(mu1, sigma1, mu2, sigma2):
-    return torch.log(sigma2 / sigma1) + (sigma1**2 + (mu1 - mu2)**2) / (2 * sigma2**2) - 0.5
-
-def kl_gaussian_monte_carlo(mu1, sigma1, mu2, sigma2, n=200_000):
-    \"\"\"Estimate KL(p || q) via Monte Carlo: KL = E_p [log p(x) - log q(x)]\"\"\"
-    x = mu1 + sigma1 * torch.randn(n)
-    # log density of normal: -0.5 * ((x - mu)/sigma)^2 - log(sigma) - 0.5*log(2*pi)
-    log_p = -0.5 * ((x - mu1) / sigma1)**2 - torch.log(sigma1) - 0.5 * math.log(2*math.pi)
-    log_q = -0.5 * ((x - mu2) / sigma2)**2 - torch.log(sigma2) - 0.5 * math.log(2*math.pi)
-    return (log_p - log_q).mean()
-
-# Test cases
 cases = [
-    (0.0, 1.0, 0.0, 1.0),   # identical -> KL = 0
-    (0.0, 1.0, 1.0, 1.0),   # shifted   -> KL = 0.5 * (mu_diff^2 / sigma^2) = 0.5
-    (0.0, 1.0, 0.0, 2.0),   # wider q   -> KL > 0
-    (1.0, 0.5, 0.0, 1.0),   # shifted + narrower p
+    (0.0, 1.0, 0.0, 1.0, "identical"),
+    (0.0, 1.0, 1.0, 1.0, "shifted mean"),
+    (0.0, 1.0, 0.0, 2.0, "wider"),
+    (0.0, 2.0, 0.0, 1.0, "narrower"),
+    (2.0, 0.5, 0.0, 1.0, "shifted + narrower"),
 ]
-for mu1, s1, mu2, s2 in cases:
-    cf = kl_gaussian_closed_form(torch.tensor(mu1), torch.tensor(s1),
-                                  torch.tensor(mu2), torch.tensor(s2)).item()
-    torch.manual_seed(0)
-    mc = kl_gaussian_monte_carlo(torch.tensor(mu1), torch.tensor(s1),
-                                  torch.tensor(mu2), torch.tensor(s2)).item()
-    print(f"N({mu1}, {s1}^2) || N({mu2}, {s2}^2):  closed-form={cf:+.4f}   MC={mc:+.4f}")
-"""))
+x_range = np.linspace(-5, 5, 400)
 
-cells.append(md("""\
-Closed-form and Monte Carlo agree to 2–3 decimal places (residual is finite-sample noise). The closed form is what we use in DDPM training: it's exact and avoids Monte Carlo variance.
+fig, axes = plt.subplots(1, len(cases), figsize=(3.5 * len(cases), 3.5))
+for ax, (m1, s1, m2, s2, label) in zip(axes, cases):
+    p1 = np.exp(-0.5 * ((x_range - m1) / s1)**2) / (s1 * np.sqrt(2 * np.pi))
+    p2 = np.exp(-0.5 * ((x_range - m2) / s2)**2) / (s2 * np.sqrt(2 * np.pi))
+    ax.plot(x_range, p1, label=f"p = N({m1}, {s1}²)")
+    ax.plot(x_range, p2, label=f"q = N({m2}, {s2}²)")
+    ax.fill_between(x_range, np.minimum(p1, p2), alpha=0.2)
+    ax.set_title(f"{label}\\n" + r"$D_{KL}(p \| q) = $" + f"{kl_normal(m1, s1, m2, s2):.3f}")
+    ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+"""))
+cells.append(md(r"""\
+Each subplot title shows the KL value. Notice:
+- Identical → 0.
+- Slightly different → small positive number.
+- Very different → large positive number.
+
+KL is *asymmetric* — $D_{KL}(p \| q) \ne D_{KL}(q \| p)$ in general. In DDPM, the loss measures $D_{KL}(q \| p_\theta)$ — how different the true reverse posterior is from the model's reverse posterior. Minimizing this drives $p_\theta$ toward $q$.
+
+When both distributions are Gaussian (which they are in DDPM, by construction), this KL is a closed-form scalar — no Monte Carlo needed. This is why the whole DDPM math machinery is tractable.
 """))
 
 # ============================================================================
-# Section 7: Conditional posterior q(x_{t-1}|x_t, x_0)
+# Section 12 — Why we condition on x_0 in the posterior
 # ============================================================================
 cells.append(md(r"""\
-## §3.1 — Conditional posterior $q(x_{t-1} \mid x_t, x_0)$ (Equations 6 & 7)
+## Section 12 — "Why $x_0$ in the posterior?"
 
-Paper equations 6 and 7:
+The paper introduces the **conditional posterior** $q(x_{t-1} \mid x_t, x_0)$. It conditions on the *original clean image* $x_0$, even though the whole point is that we don't know $x_0$ at sampling time.
 
-$$q(x_{t-1} \mid x_t, x_0) = \mathcal{N}\!\bigl(x_{t-1};\ \tilde\mu_t(x_t, x_0),\ \tilde\beta_t I\bigr)$$
-$$\tilde\mu_t(x_t, x_0) := \frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1 - \bar\alpha_t}\,x_0 + \frac{\sqrt{\alpha_t}(1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t}\,x_t$$
-$$\tilde\beta_t := \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\,\beta_t$$
+The answer is subtle: **during training we DO know $x_0$ — it's a sample from the training set.** We use this temporary knowledge to construct an *exact target* for the reverse step. The neural network then learns to match this target *without* needing $x_0$. After training, the network can run with only $x_t$.
 
-This is the **true reverse posterior** *given* we know the clean image $x_0$. During training we *do* know $x_0$, so this gives us an exact Gaussian target. The model then learns to approximate this Gaussian *without* seeing $x_0$.
-
-Verify the mean formula against Monte Carlo: sample many $x_t$ from $x_0$ via the forward, then sample $x_{t-1}$ from the joint, then condition on $x_t$ being near a specific value.
-
-A more efficient check: sample $(x_{t-1}, x_t)$ pairs from the forward chain, then statistically estimate the conditional mean by *binning* the samples by $x_t$ values and computing the mean of $x_{t-1}$ within each bin. Compare to the formula.
+Visualize this on the spiral. Pick a single $x_0$, then ask: what does $q(x_{t-1} \mid x_t, x_0)$ look like for a fixed $x_t$? It's a Gaussian — let's draw its 1σ contour.
 """))
 cells.append(code("""\
 alpha_bars_prev = F.pad(alpha_bars[:-1], (1, 0), value=1.0)
-alphas = 1 - betas
 
 def q_posterior_mean(x_t, x_0, t):
-    \"\"\"Equation 7 in paper.\"\"\"
+    \"\"\"Paper equation 7: posterior mean.\"\"\"
     coef_x0 = (alpha_bars_prev[t].sqrt() * betas[t]) / (1 - alpha_bars[t])
     coef_xt = (alphas[t].sqrt() * (1 - alpha_bars_prev[t])) / (1 - alpha_bars[t])
     return coef_x0 * x_0 + coef_xt * x_t
 
-# Numerical verification:
-# For a fixed x_0, draw many (x_{t-1}, x_t) pairs from the forward process,
-# then condition on x_t ≈ a specific value and check that mean(x_{t-1}) matches q_posterior_mean.
+def q_posterior_var(t):
+    \"\"\"Paper: posterior variance.\"\"\"
+    return betas[t] * (1 - alpha_bars_prev[t]) / (1 - alpha_bars[t])
+
+# Pick a specific x_0 and x_t
+x0_pick = torch.tensor([[1.0, 0.0]])
+t_pick = 100
 torch.manual_seed(0)
-N = 500_000
-t = 50
-x_0_val = 0.7
-x_0 = torch.full((N,), x_0_val, device=DEVICE)
+ab_t = alpha_bars[t_pick]
+eps_pick = torch.tensor([[0.5, 0.3]])    # arbitrary noise
+x_t_pick = ab_t.sqrt() * x0_pick + (1 - ab_t).sqrt() * eps_pick
 
-# Step 1: sample x_{t-1} from q(x_{t-1} | x_0) (closed form to t-1)
-ab_tm1 = alpha_bars[t-1]
-x_tm1 = ab_tm1.sqrt() * x_0 + (1 - ab_tm1).sqrt() * torch.randn(N)
+mean = q_posterior_mean(x_t_pick, x0_pick, torch.tensor([t_pick]))[0]
+sigma = q_posterior_var(torch.tensor([t_pick])).sqrt().item()
 
-# Step 2: sample x_t from x_{t-1} via the per-step forward
-x_t = torch.sqrt(1 - betas[t]) * x_tm1 + betas[t].sqrt() * torch.randn(N)
+# Plot
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(x0_data[:, 0], x0_data[:, 1], s=3, alpha=0.2, c="lightgray", label="spiral data")
+ax.scatter(*x0_pick[0].tolist(), s=200, c="black", marker="*", label=r"$x_0$")
+ax.scatter(*x_t_pick[0].tolist(), s=200, c="red", marker="X", label=r"$x_t$ (sampled from $q(x_t|x_0)$)")
+ax.scatter(*mean.tolist(), s=200, c="blue", marker="o",
+           label=r"$\\tilde\\mu_t(x_t, x_0)$ — posterior mean (predicts where $x_{t-1}$ is)")
 
-# Now condition: pick samples where x_t is near a target value
-x_t_target = 0.3
-window = 0.02
-mask = (x_t > x_t_target - window) & (x_t < x_t_target + window)
-empirical_mean = x_tm1[mask].mean().item()
-print(f"# samples in window: {mask.sum().item()}")
-
-# Compare to closed-form posterior mean
-predicted = q_posterior_mean(torch.tensor(x_t_target), torch.tensor(x_0_val), torch.tensor(t)).item()
-print(f"empirical mean of x_{{t-1}} | x_t ≈ {x_t_target}, x_0 = {x_0_val}: {empirical_mean:+.4f}")
-print(f"closed-form  q_posterior_mean from eq 7:                       {predicted:+.4f}")
+theta = np.linspace(0, 2 * np.pi, 100)
+ax.plot(mean[0] + sigma * np.cos(theta), mean[1] + sigma * np.sin(theta), 'b--', alpha=0.6, label="1σ posterior")
+ax.set_title(f"q(x_{{t-1}} | x_t, x_0) at t={t_pick}: posterior mean (blue) given x_0 (black) and x_t (red)")
+ax.legend(fontsize=8); ax.set_aspect("equal"); ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
 """))
+cells.append(md(r"""\
+- **Black star ($x_0$)**: the clean source image, on the spiral.
+- **Red X ($x_t$)**: a noisy version after applying the forward process.
+- **Blue circle ($\tilde\mu_t(x_t, x_0)$)**: the *mean* of the conditional posterior. This is where $x_{t-1}$ is most likely to be, given that we came from $x_0$ and we're at $x_t$.
+- **Blue dashed circle**: the 1σ contour of the conditional posterior. $x_{t-1}$ falls in here ~68% of the time.
 
-cells.append(md("""\
-The empirical conditional mean (from binned samples) and the closed-form formula agree to 2-3 decimal places. **The posterior is Gaussian and we know its mean exactly** — this is what makes the $L_{t-1}$ term tractable.
+The posterior mean is *between* $x_t$ and $x_0$ — it's a weighted average. The weight depends on the timestep:
+- At small $t$ (near data), $\tilde\mu$ is close to $x_0$.
+- At large $t$ (near noise), $\tilde\mu$ is closer to $x_t$.
+
+This makes intuitive sense: when the noise is small, we trust the data direction; when the noise is large, the noisy $x_t$ is informative on its own.
+
+**Why is this called the "posterior"?** It's a *backward conditional* — given what's downstream ($x_t$ and ultimately $x_0$), what was $x_{t-1}$? Bayes' rule lets us compute this analytically because the forward process is Gaussian.
+
+### The training target
+
+In the DDPM loss, the network's reverse step $p_\theta(x_{t-1} \mid x_t)$ is *trained* to match this posterior. Specifically, the network learns to predict $\varepsilon_\theta(x_t, t)$ such that the implied mean equals $\tilde\mu_t(x_t, x_0)$ on average. Since the network sees only $x_t$ (not $x_0$), it learns a *marginal* version: given $x_t$, what does $\tilde\mu_t$ tend to look like across all possible $x_0$ that could have produced this $x_t$?
 """))
 
 # ============================================================================
-# Section 8: epsilon-parameterization
+# Section 13 — Summary
 # ============================================================================
 cells.append(md(r"""\
-## §3.2 — ε-parameterization (Equations 10 & 11)
+## Section 13 — Summary
 
-Substitute $x_0 = \frac{1}{\sqrt{\bar\alpha_t}}(x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon)$ into the formula for $\tilde\mu_t$ above. The algebra gives **paper equation 10**:
+We translated the entire DDPM math into visualized 2D operations:
 
-$$\tilde\mu_t(x_t, x_0) = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\,\varepsilon\right)$$
-
-So if the model predicts $\varepsilon_\theta(x_t, t)$, we mechanically derive $\mu_\theta$:
-
-$$\mu_\theta(x_t, t) := \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\,\varepsilon_\theta(x_t, t)\right) \qquad \text{(paper eq 11)}$$
-
-**Verify the substitution numerically.** Given a known $(x_0, \varepsilon, t)$, build $x_t$ via the forward, then compute $\tilde\mu_t$ two ways: (a) from $(x_t, x_0)$ using eq 7, (b) from $(x_t, \varepsilon)$ using eq 10. They should be identical (to floating-point precision).
-"""))
-cells.append(code("""\
-def tilde_mu_from_x0(x_t, x_0, t):
-    \"\"\"Paper eq 7: mu_tilde as a function of (x_t, x_0).\"\"\"
-    return q_posterior_mean(x_t, x_0, t)
-
-def tilde_mu_from_eps(x_t, eps, t):
-    \"\"\"Paper eq 10: mu_tilde as a function of (x_t, eps).\"\"\"
-    return (1.0 / alphas[t].sqrt()) * (x_t - (betas[t] / (1 - alpha_bars[t]).sqrt()) * eps)
-
-# Numerical check
-torch.manual_seed(0)
-x_0 = torch.randn(4, 3, 8, 8) * 0.3        # some "clean image"
-t = 100
-eps = torch.randn_like(x_0)
-ab_t = alpha_bars[t]
-x_t = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps
-
-mu_from_x0  = tilde_mu_from_x0(x_t, x_0, torch.tensor(t))
-mu_from_eps = tilde_mu_from_eps(x_t, eps, torch.tensor(t))
-max_diff = (mu_from_x0 - mu_from_eps).abs().max().item()
-print(f"max |mu(eq 7) - mu(eq 10)| = {max_diff:.2e}    (~machine epsilon)")
-print(f"identity holds:  the substitution from eq 7 to eq 10 is exact")
-"""))
-
-cells.append(md("""\
-Machine-epsilon precision — the two formulas are algebraically identical, the substitution is exact. **Predicting $\\varepsilon$ is mathematically equivalent to predicting $\\tilde\\mu_t$**, just expressed in a different variable.
-"""))
-
-# ============================================================================
-# Section 9: predict_start_from_noise (used in sampling code)
-# ============================================================================
-cells.append(md(r"""\
-## §3.2 — Recovering $x_0$ from $\varepsilon$ prediction
-
-In sampling code (and in the YHL04 implementation), it's often useful to recover an explicit $\hat x_0$ estimate at each step. Just invert the closed-form forward equation:
-
-$$\hat x_0 = \frac{1}{\sqrt{\bar\alpha_t}}\!\bigl(x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon_\theta(x_t, t)\bigr)$$
-
-This is what the `predict_start_from_noise` function does in production diffusion code, and it's what enables the `x_recon.clamp_(-1, 1)` numerical-stability trick we used in the Day 2 notebook: clip $\hat x_0$ to the valid image range to prevent amplification of small prediction errors.
-"""))
-cells.append(code("""\
-def predict_start_from_noise(x_t, eps, t):
-    \"\"\"Algebraic inverse of x_t = sqrt(ab) * x_0 + sqrt(1-ab) * eps.\"\"\"
-    ab = alpha_bars[t]
-    return (x_t - (1 - ab).sqrt() * eps) / ab.sqrt()
-
-# Numerical check: round-trip the forward
-torch.manual_seed(0)
-x_0 = torch.randn(2, 3, 8, 8) * 0.5
-t = 200
-eps = torch.randn_like(x_0)
-ab_t = alpha_bars[t]
-x_t = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps
-x_0_recovered = predict_start_from_noise(x_t, eps, torch.tensor(t))
-err = (x_0_recovered - x_0).abs().max().item()
-print(f"max |x_0_recovered - x_0_true| = {err:.2e}")
-"""))
-
-# ============================================================================
-# Section 10: L_simple
-# ============================================================================
-cells.append(md(r"""\
-## §3.4 — The simplified training loss $L_\text{simple}$ (Equation 14)
-
-Once we have ε-parameterization, the per-step loss collapses (paper eq 12) into:
-
-$$L_{t-1} - C = \mathbb{E}_{x_0,\,\varepsilon}\!\left[\frac{\beta_t^2}{2\sigma_t^2\,\alpha_t\,(1-\bar\alpha_t)}\,\|\varepsilon - \varepsilon_\theta(x_t, t)\|^2\right]$$
-
-The paper **discards the weighting** to get the famous (and empirically best-performing) loss — paper equation 14:
-
-$$L_\text{simple}(\theta) = \mathbb{E}_{t,\,x_0,\,\varepsilon}\!\left[\|\varepsilon - \varepsilon_\theta(\sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\varepsilon,\ t)\|^2\right]$$
-
-In code, one training step looks like this:
-"""))
-cells.append(code("""\
-def one_training_step(model, x_0, T, alpha_bars):
-    \"\"\"Paper Algorithm 1, one step.\"\"\"
-    B = x_0.size(0)
-    t   = torch.randint(0, T, (B,), device=x_0.device)
-    eps = torch.randn_like(x_0)
-    ab  = alpha_bars[t].view(B, 1, 1, 1)
-    x_t = ab.sqrt() * x_0 + (1 - ab).sqrt() * eps
-    eps_pred = model(x_t, t)
-    loss = F.mse_loss(eps_pred, eps)
-    return loss
-
-# Demonstration: define a TINY stub "model" that outputs random noise
-# (predictably bad, just to show the loop mechanics)
-class StubModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.dummy = torch.nn.Parameter(torch.zeros(1))
-    def forward(self, x_t, t):
-        # Random prediction (untrained -- just for shape testing)
-        return torch.randn_like(x_t) + 0.0 * self.dummy
-
-model = StubModel().to(DEVICE)
-x_0_batch = torch.randn(4, 3, 8, 8, device=DEVICE)
-loss = one_training_step(model, x_0_batch, T, alpha_bars)
-print(f"untrained model loss: {loss.item():.3f}  (expect ~2 -- two independent unit-variance vectors)")
-"""))
-
-cells.append(md("""\
-For a totally untrained model that outputs random noise, the loss is around 2 — the expected squared distance between two independent unit-Gaussian random vectors. A trained model brings this down toward 0.
-
-**Algorithm 1 in full** (paper page 4):
-
-```
-repeat
-    x_0 ~ q(x_0)                            # sample real image
-    t ~ Uniform({1, ..., T})                # random timestep
-    eps ~ N(0, I)                           # standard Gaussian noise
-    Take gradient step on:
-        ∇_θ || eps - eps_θ(sqrt(ab_t)*x_0 + sqrt(1-ab_t)*eps, t) ||^2
-until converged
-```
-
-That's the entire training loop.
-"""))
-
-# ============================================================================
-# Section 11: Algorithm 2 (Sampling)
-# ============================================================================
-cells.append(md(r"""\
-## §3.4 — Sampling (Algorithm 2)
-
-Generate one image by running the reverse Markov chain. Each iteration: predict $\varepsilon$, plug into the closed-form mean (eq 11), add stochastic noise.
-
-**Paper Algorithm 2:**
-
-```
-x_T ~ N(0, I)
-for t = T, ..., 1:
-    z ~ N(0, I)   if t > 1   else z = 0
-    x_{t-1} = (1/sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - ab_t)) * eps_theta(x_t, t)) + sigma_t * z
-return x_0
-```
-
-In code:
-"""))
-cells.append(code("""\
-@torch.no_grad()
-def sample(model, shape, T, alpha_bars, betas):
-    \"\"\"Paper Algorithm 2.\"\"\"
-    alphas = 1 - betas
-    sigmas = betas.sqrt()                       # Paper §3.2 'first choice' for the variance
-    x = torch.randn(shape, device=DEVICE)
-    for t in reversed(range(T)):
-        t_b = torch.full((shape[0],), t, device=DEVICE, dtype=torch.long)
-        eps_pred = model(x, t_b)
-        ab_t = alpha_bars[t]; a_t = alphas[t]; b_t = betas[t]
-        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()
-        if t > 0:
-            x = mean + sigmas[t] * torch.randn_like(x)
-        else:
-            x = mean
-    return x
-
-# With our stub model, the output is meaningless, but the loop runs:
-out = sample(model, (1, 3, 8, 8), T=50, alpha_bars=alpha_bars[:50], betas=betas[:50])
-print(f"Algorithm 2 output (untrained stub): shape={out.shape}  range=[{out.min().item():+.2f}, {out.max().item():+.2f}]")
-print("(values are nonsense without a trained model -- this just verifies the loop runs)")
-"""))
-
-cells.append(md("""\
-For real samples, train the model on actual data (see **`day2/day2_diffusion.ipynb`**, which uses the YHL04/ddpm UNet and produces actual images). This notebook only shows the math is correctly translated to code.
-"""))
-
-# ============================================================================
-# Section 12: Summary table
-# ============================================================================
-cells.append(md("""\
-## Summary — every equation, paired with its function
-
-| Paper | Equation | Code |
+| Concept | Section | What you saw |
 |---|---|---|
-| §2 eq 2 | $q(x_t \\mid x_{t-1}) = \\mathcal{N}(\\sqrt{1-\\beta_t}\\,x_{t-1}, \\beta_t I)$ | `per_step_forward(x_prev, beta_t)` |
-| §2 eq 4 | $q(x_t \\mid x_0) = \\mathcal{N}(\\sqrt{\\bar\\alpha_t}\\,x_0, (1-\\bar\\alpha_t)I)$ | `q_sample(x_0, t, alpha_bars)` |
-| §2 eq 1 | $p_\\theta(x_{t-1} \\mid x_t) = \\mathcal{N}(\\mu_\\theta, \\Sigma_\\theta)$ | `one_reverse_step(x_t, mu, sigma, t)` |
-| §2 eq 5 | $L = L_T + \\sum L_{t-1} + L_0$ (variational bound) | `kl_gaussian_closed_form(...)` |
-| §2 eq 6, 7 | $q(x_{t-1} \\mid x_t, x_0) = \\mathcal{N}(\\tilde\\mu_t, \\tilde\\beta_t I)$ | `q_posterior_mean(x_t, x_0, t)` |
-| §3.2 eq 10 | $\\tilde\\mu_t = \\frac{1}{\\sqrt{\\alpha_t}}(x_t - \\frac{\\beta_t}{\\sqrt{1-\\bar\\alpha_t}}\\varepsilon)$ | `tilde_mu_from_eps(x_t, eps, t)` |
-| §3.2 eq 11 | $\\mu_\\theta = \\frac{1}{\\sqrt{\\alpha_t}}(x_t - \\frac{\\beta_t}{\\sqrt{1-\\bar\\alpha_t}}\\varepsilon_\\theta)$ | (same formula, with model's $\\varepsilon$) |
-| §3.4 eq 14 | $L_\\text{simple} = \\mathbb{E}[\\|\\varepsilon - \\varepsilon_\\theta\\|^2]$ | `one_training_step(model, x_0, ...)` |
-| §3.4 Alg 1 | Training procedure | `one_training_step(...)` |
-| §3.4 Alg 2 | Sampling procedure | `sample(model, shape, T, ...)` |
+| What $q(x_0)$ means | §1, §2 | Spiral scatter plot — a distribution as a *cloud of samples* |
+| Isotropic Gaussian $\mathcal{N}(0, \sigma^2 I)$ | §3 | Circular blob; identity matrix = "same noise everywhere, no correlations" |
+| Per-step forward $q(x_t \mid x_{t-1})$ | §4 | Shrink-then-add-noise on the spiral |
+| Closed-form forward $q(x_t \mid x_0)$ | §5, §6 | Cumulative shrink + cumulative noise; identical distribution to iterating |
+| What "isotropic noise" means | §7 | One point → circular cloud of possible noised positions |
+| Train $\varepsilon_\theta(x_t, t)$ | §8 | Tiny MLP, ~50k params, trained in 8000 steps |
+| Sampling (Algorithm 2) | §9 | Noise → spiral, six snapshots |
+| Score field | §10 | $-\varepsilon_\theta$ as an arrow field pointing toward the data |
+| KL divergence | §11 | Side-by-side Gaussians with KL values shown |
+| Conditional posterior $q(x_{t-1} \mid x_t, x_0)$ | §12 | Weighted average between $x_0$ and $x_t$, with σ-contour |
 
-Every equation from sections 2 and 3 of the DDPM paper has a corresponding function above. Each function was verified against either Monte Carlo, an algebraic identity, or both.
+### What you should now be able to do
 
-**Next step** — to see all this run on real images and produce visible samples, work through `day2/day2_diffusion.ipynb`. That notebook uses the YHL04/ddpm UNet with Improved-DDPM extensions (cosine schedule, learned variance, hybrid loss) to train a real diffusion model on 1,221 anime images.
+1. **Read DDPM-style equations** without getting stuck on notation: $q$, $p_\theta$, subscripts, $\mathcal{N}(\cdot;\cdot,\cdot)$, $I$ as identity matrix.
+2. **Explain why $\beta_t I$ as covariance means "isotropic noise"**: every dimension gets the same independent Gaussian.
+3. **See the chain structure**: $x_0$ (clean) → $x_T$ (noise) → back to $x_0$, with each per-step transition being a small Gaussian shift.
+4. **Understand the role of the closed-form forward** (Section 6) — it makes training feasible by avoiding the inner $t$-step loop.
+5. **Understand the role of $x_0$ in the posterior** (Section 12) — we have $x_0$ during training, use it as a target, then the model learns to do without it.
+6. **Connect ε-prediction to the score** (Section 10) — predicting noise is equivalent to learning the score field, which points toward the data.
+
+### Next
+
+`day2/day2_diffusion.ipynb` runs the same math on real 64×64 anime images using the YHL04/ddpm reference UNet. Everything here generalizes — only the dimensionality changes from 2 to $3 \times 64 \times 64 = 12{,}288$. The math, the schedule, the loss, the sampler — all identical in form, just bigger tensors.
 """))
 
 
