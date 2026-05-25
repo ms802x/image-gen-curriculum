@@ -827,6 +827,99 @@ The exponential decay you see when plotting $\bar\alpha_t$ over $t$ (e.g., the s
 
 ---
 
+## Q&A — how does the noise term appear when equation 4 becomes the sample form?
+
+Equation 4 of the paper specifies a Gaussian:
+
+$$q(x_t \mid x_0) = \mathcal{N}\!\bigl(x_t;\ \sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t)\,I\bigr)$$
+
+but the sample form (the line of code you actually run) is:
+
+$$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, I)$$
+
+Where does the noise term $\sqrt{1-\bar\alpha_t}\,\varepsilon$ come from? It looks like it appeared out of nowhere. **It didn't — it's the standard deviation of the Gaussian made explicit so the distribution can be sampled.** This is the *reparameterization trick*.
+
+### The general fact (location-scale property of Gaussians)
+
+If $Z \sim \mathcal{N}(0, 1)$ — the **standard normal** with mean 0 and variance 1 — and you compute
+$$X = \mu + \sigma \cdot Z$$
+then $X \sim \mathcal{N}(\mu, \sigma^2)$.
+
+Quick check:
+- $E[X] = E[\mu + \sigma Z] = \mu + \sigma \cdot 0 = \mu$ ✓
+- $\text{Var}(X) = \text{Var}(\mu + \sigma Z) = \sigma^2 \cdot \text{Var}(Z) = \sigma^2$ ✓
+
+So you don't need to know how to "draw directly from $\mathcal{N}(\mu, \sigma^2)$" for arbitrary $\mu, \sigma$. You draw from the *fixed* standard normal (which `torch.randn` knows how to do) and shift + scale.
+
+### Same thing in multiple dimensions, for isotropic covariance
+
+For multivariate Gaussians with covariance $\sigma^2 I$ (isotropic):
+
+> If $\boldsymbol{\varepsilon} \sim \mathcal{N}(0, I)$ — `torch.randn(d)` for a $d$-dimensional vector — and you compute
+> $$\mathbf{X} = \boldsymbol{\mu} + \sigma \cdot \boldsymbol{\varepsilon}$$
+> then $\mathbf{X} \sim \mathcal{N}(\boldsymbol{\mu}, \sigma^2 I)$.
+
+Same reasoning: linear shift moves the mean, scalar multiply scales each dimension's variance by $\sigma^2$, and dimensions stay independent because $\boldsymbol{\varepsilon}$'s dimensions are independent.
+
+### Apply to equation 4
+
+Read off the mean and standard deviation from equation 4:
+- Mean $\boldsymbol{\mu} = \sqrt{\bar\alpha_t}\,x_0$
+- Covariance $(1-\bar\alpha_t)\,I$, so standard deviation $\sigma = \sqrt{1-\bar\alpha_t}$
+
+Plug into the recipe $\mathbf{X} = \boldsymbol{\mu} + \sigma \cdot \boldsymbol{\varepsilon}$:
+
+$$x_t = \underbrace{\sqrt{\bar\alpha_t}\,x_0}_{\mu} + \underbrace{\sqrt{1-\bar\alpha_t}}_{\sigma} \cdot \underbrace{\boldsymbol{\varepsilon}}_{\sim \mathcal{N}(0, I)}$$
+
+The noise term wasn't added from nowhere. It's the standard-deviation scaling factor of the Gaussian in equation 4, made explicit so we can construct a sample using `torch.randn`.
+
+### "Where did the identity matrix $I$ go?"
+
+In equation 4 the covariance is $(1-\bar\alpha_t)\,I$, a *matrix*. In the sample form, $\sqrt{1-\bar\alpha_t}$ is a *scalar*. The $I$ didn't vanish — it's hiding inside $\boldsymbol{\varepsilon}$.
+
+- **Distribution form** says *what* the covariance is: $\Sigma = \sigma^2 I$.
+- **Sample form** does this by *building* a noise vector with that covariance: $\sigma \cdot \boldsymbol{\varepsilon}$ where $\boldsymbol{\varepsilon}$ has covariance $I$, so $\sigma \boldsymbol{\varepsilon}$ has covariance $\sigma^2 I$.
+
+The $I$ moved from "specification of $\Sigma$" to "specification of how we sample $\boldsymbol{\varepsilon}$."
+
+### Code mapping
+
+This is exactly what `q_sample` does:
+
+```python
+def q_sample(x0, t):
+    ab = alpha_bars[t]            # scalar in [0, 1]
+    eps = torch.randn_like(x0)    # eps ~ N(0, I)  -- the standard Gaussian
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+    #      └── μ ──┘   └────── σ ──────┘  └ε┘
+    #      shift       scale              standard noise
+```
+
+Three pieces map exactly onto the math:
+- Mean shift: $\sqrt{\bar\alpha_t}\,x_0$
+- Standard deviation: $\sqrt{1-\bar\alpha_t}$
+- Standard noise draw: `torch.randn_like` $\to \boldsymbol{\varepsilon} \sim \mathcal{N}(0, I)$
+
+Multiplying the scalar $\sigma$ by `eps` produces noise with covariance $\sigma^2 I$ — which is what equation 4 demanded.
+
+### The general pattern (useful far beyond DDPM)
+
+Whenever a paper writes $X \sim \mathcal{N}(\boldsymbol{\mu}, \Sigma)$ and you need to *sample* $X$, the universal recipe is:
+
+1. Sample $\boldsymbol{\varepsilon} \sim \mathcal{N}(0, I)$ via `torch.randn`.
+2. Factorize $\Sigma = L L^\top$ (Cholesky decomposition).
+3. Compute $X = \boldsymbol{\mu} + L \boldsymbol{\varepsilon}$.
+
+For *isotropic* $\Sigma = \sigma^2 I$, the Cholesky factor is $L = \sigma I$, so step 3 collapses to $X = \boldsymbol{\mu} + \sigma \boldsymbol{\varepsilon}$ — the case we hit in DDPM.
+
+This is the same machinery that powers VAE training (the *reparameterization trick* of Kingma & Welling 2013 — making sampling differentiable by routing randomness through an external $\boldsymbol{\varepsilon}$ rather than into the model parameters). The trick is foundational to most Gaussian-based generative models.
+
+### One-line summary
+
+The noise term $\sqrt{1-\bar\alpha_t}\,\varepsilon$ in the sample form is just the standard deviation of the equation-4 Gaussian, multiplied by a standard-normal vector. The reparameterization trick says: any Gaussian sample is `mean + std × standard_normal_sample`. Equation 4 gives you the mean and variance; the sample form is the same distribution written in a way you can call `torch.randn` against.
+
+---
+
 ## Further reading — the best resources to deepen this material
 
 **Honest preamble.** There is **no Goodfellow-Bengio-Courville-equivalent textbook for diffusion models** as of 2026. The field is too young and moves too fast for that kind of consolidation. What exists instead is a handful of *book-length tutorials* (PDFs and arXiv preprints) plus excellent blog posts. The list below ranks them by usefulness for the goal you stated: *understanding the math deeply*. Every entry is verified — links go to real, currently-available resources.
