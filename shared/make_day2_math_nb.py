@@ -650,41 +650,271 @@ The trained ResMLP achieves a ratio of ~1.1, confirming the model has learned $q
 # Section 10 — Visualize the score field (epsilon prediction)
 # ============================================================================
 cells.append(md(r"""\
-## Section 10 — Visualize the score field
+## Section 10 — The score field, in detail
 
-The model predicts $\varepsilon_\theta(x_t, t)$ at every point in space. This prediction has a **geometric interpretation**: it points *toward more noise*, so $-\varepsilon_\theta$ points *toward the data*. Visualize this as an arrow field.
+The trained model $\varepsilon_\theta(x_t, t)$ is a function from 2D space to 2D vectors. At any point $(x, y)$ in the plane and any timestep $t$, it returns a prediction of what noise was added.
 
-We evaluate $\varepsilon_\theta$ on a grid of $(x, y)$ points at a moderate timestep ($t = 100$ — halfway between data and pure noise) and plot the negative prediction (so arrows point toward the data manifold).
+**Geometric interpretation.** $-\varepsilon_\theta(x_t, t)$ is the "direction toward the data manifold." If you stood at point $x_t$ in the noisified space at timestep $t$ and took a tiny step in the direction of $-\varepsilon_\theta(x_t, t)$, you'd move toward more data-like region. The DDPM reverse process is essentially "follow this direction many times, with a bit of randomness, until you reach the data."
+
+**Three visualizations, in increasing depth:**
+
+1. **Arrows + magnitude heatmap** — the arrow shows direction, the background color shows how *strongly* the model is pulling toward the data at each location.
+2. **Streamlines** — continuous flow lines through the field. Each line is a deterministic trajectory if you followed $-\varepsilon_\theta$ without adding any noise. This is the "deterministic DDIM" view.
+3. **Evolution across timesteps** — how the field changes as $t$ decreases from pure noise toward data.
+"""))
+
+cells.append(code("""\
+# Build a finer grid for richer visualizations
+import numpy as np
+GRID_N = 40
+xs = np.linspace(-2.5, 2.5, GRID_N)
+ys = np.linspace(-2.5, 2.5, GRID_N)
+grid_x, grid_y = np.meshgrid(xs, ys)
+grid_torch = torch.tensor(np.stack([grid_x.flatten(), grid_y.flatten()], axis=-1), dtype=torch.float32)
+grid_dev = grid_torch.to(DEVICE)
+
+@torch.no_grad()
+def eval_field(t_val):
+    \"\"\"Evaluate eps_theta on the grid at the given timestep.\"\"\"
+    t_batch = torch.full((grid_dev.shape[0],), t_val, device=DEVICE, dtype=torch.long)
+    return model(grid_dev, t_batch).cpu().numpy()
+
+print(f"grid: {GRID_N}x{GRID_N} = {GRID_N*GRID_N} evaluation points")
+"""))
+
+cells.append(md(r"""\
+### View 1 — Arrows + magnitude heatmap at $t = 100$
+
+The background color (viridis) shows $\|\varepsilon_\theta(x_t, t)\|$ — how *strong* the noise prediction is at each point. Bright = far from data, lots of denoising needed. Dark = near data, little denoising needed. The red arrows show the *direction* of $-\varepsilon_\theta$ (toward the data), and their length is rendered identically to be readable.
 """))
 cells.append(code("""\
-# Build a grid in 2D
-grid_x, grid_y = torch.meshgrid(torch.linspace(-2.5, 2.5, 20), torch.linspace(-2.5, 2.5, 20), indexing="xy")
-grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
-
 t_score = 100
-grid_dev = grid.to(DEVICE)
-t_batch = torch.full((grid_dev.shape[0],), t_score, device=DEVICE, dtype=torch.long)
-model.eval()
-with torch.no_grad():
-    eps_field = model(grid_dev, t_batch).cpu()
+field = eval_field(t_score)
+mag = np.linalg.norm(field, axis=1).reshape(grid_x.shape)
+ux = -field[:, 0].reshape(grid_x.shape)
+uy = -field[:, 1].reshape(grid_x.shape)
 
-# Plot: -eps_field arrows on top of the noisy data at this t
+# Normalize arrows to unit length so we read only direction (magnitude is on the heatmap)
+mag_safe = np.sqrt(ux**2 + uy**2) + 1e-8
+ux_unit = ux / mag_safe; uy_unit = uy / mag_safe
+
+# Subsample arrows so the plot isn't a forest
+sub = 2
 torch.manual_seed(0)
-noisy_data = q_sample(x0_data, t_score)        # x0_data is CPU, so q_sample uses CPU schedule
+noisy_data = q_sample(x0_data, t_score).numpy()
 
-fig, ax = plt.subplots(figsize=(8, 8))
-ax.scatter(noisy_data[:, 0], noisy_data[:, 1], s=3, alpha=0.3, c="tab:gray", label=f"q(x_{t_score})")
-ax.quiver(grid[:, 0], grid[:, 1], -eps_field[:, 0], -eps_field[:, 1],
-          angles="xy", scale_units="xy", scale=10, alpha=0.7, color="tab:red")
-ax.set_title(f"Negative noise prediction (red arrows) at t = {t_score}\\n"
-             f"arrows point toward the data manifold; gray = noisy data q(x_{t_score})")
-ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_aspect("equal"); ax.grid(alpha=0.3); ax.legend()
+fig, ax = plt.subplots(figsize=(9, 9))
+im = ax.imshow(mag, extent=[-2.5, 2.5, -2.5, 2.5], origin="lower", cmap="viridis", alpha=0.5, vmin=0, vmax=mag.max())
+plt.colorbar(im, ax=ax, label=r"$\|\\varepsilon_\\theta(x_t, t)\|$  (denoising effort needed)")
+ax.quiver(grid_x[::sub, ::sub], grid_y[::sub, ::sub],
+          ux_unit[::sub, ::sub], uy_unit[::sub, ::sub],
+          angles="xy", scale_units="xy", scale=8, color="tab:red", alpha=0.9, width=0.005, label=r"$-\\varepsilon_\\theta$  direction")
+ax.scatter(noisy_data[:, 0], noisy_data[:, 1], s=3, alpha=0.3, c="white", edgecolors="none", label=f"q(x_{t_score}) samples")
+ax.set_title(f"Score field at t = {t_score}\\n"
+             f"background = magnitude of $\\\\varepsilon_\\\\theta$;  red arrows = direction toward data")
+ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_aspect("equal"); ax.legend(loc="upper right", fontsize=9)
 plt.tight_layout(); plt.show()
 """))
-cells.append(md(r"""\
-The red arrows point in the direction of $-\varepsilon_\theta(x_t, t)$ — the direction to move a noisy point to **reduce noise** at this timestep. They should roughly point toward the spiral curve.
 
-This is **exactly the score function** $\nabla_x \log p_t(x)$ for the noised distribution — up to a known scalar — and explains the deep connection between DDPM ε-prediction and score-based generative modeling (Yang Song 2019). The sampling process "follows the score": at each step, take a small step in the direction that increases data likelihood, then add a bit of noise for randomness.
+cells.append(md(r"""\
+**What to read from this plot:**
+
+- **Dark regions (low magnitude)** are *near the spiral* — the model says "you're close, almost no denoising needed."
+- **Bright regions (high magnitude)** are *far from the spiral* — the model says "you have a lot of noise to remove."
+- The arrows everywhere point from bright regions toward dark regions, i.e., toward the data manifold. That's *literally* what "score field" means in this context: a gradient field pointing uphill in data density (and downhill in noise).
+
+If the model were perfect, every point in $\mathbb{R}^2$ would have an arrow pointing exactly toward the spiral — and the magnitude would be proportional to its distance. Approximately, that's what the plot shows.
+"""))
+
+cells.append(md(r"""\
+### View 2 — Streamlines (the deterministic flow)
+
+Streamlines trace the path you'd follow if you *continuously* moved in the $-\varepsilon_\theta$ direction at every point. They are the **deterministic** flow lines of the score field.
+
+**This is exactly the DDIM sampler with $\eta = 0$** — running the ODE that connects noise to data, with no stochastic noise injection. The DDPM stochastic sampler (Algorithm 2) adds a $\sigma_t z$ term at each step that *jitters* off these streamlines; without that term you'd ride a streamline deterministically.
+
+(More on that jitter in Section 10b below.)
+"""))
+cells.append(code("""\
+fig, ax = plt.subplots(figsize=(9, 9))
+strm = ax.streamplot(grid_x, grid_y, ux, uy, color=mag, cmap="viridis", density=1.6, linewidth=1.0, arrowsize=1.2)
+plt.colorbar(strm.lines, ax=ax, label=r"streamline color = magnitude $\|\\varepsilon_\\theta\|$")
+ax.scatter(x0_data[:, 0], x0_data[:, 1], s=3, alpha=0.5, c="red", label="real spiral (target)")
+ax.set_title(f"Streamlines of $-\\\\varepsilon_\\\\theta$ at t = {t_score}\\n"
+             f"each line is a deterministic 'descent path' from noise toward the data")
+ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_aspect("equal"); ax.legend(loc="upper right", fontsize=9)
+plt.tight_layout(); plt.show()
+"""))
+
+cells.append(md(r"""\
+**What the streamlines show:**
+
+- Every streamline ends *on* (or very close to) the red spiral. The model has learned that the spiral is the "attractor" of the score field.
+- Lines converge toward the spiral from all directions in the plane.
+- The deterministic interpretation: at any starting noise $x$ and timestep $t$, the model defines a path. Following that path *all the way* lands you on the data manifold.
+
+This is the geometric picture that "diffusion sampling" really paints: a flow field on the noised data space, and the sampler follows it.
+"""))
+
+cells.append(md(r"""\
+### View 3 — Evolution across timesteps
+
+The score field is *time-dependent*. Early in the reverse process ($t$ near $T$) the noisified density is wide and the field is shallow — small pulls everywhere. Late in the reverse process ($t$ near 0) the noisified density is narrow (concentrated near the spiral) and the field is sharp — strong pulls right at the manifold and near-zero pulls elsewhere.
+
+Watch the field shape change as $t$ decreases from 199 (pure noise) to 10 (almost clean).
+"""))
+cells.append(code("""\
+ts_panel = [199, 150, 100, 50, 20, 10]
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+axes = axes.flatten()
+for ax, t_val in zip(axes, ts_panel):
+    f = eval_field(t_val)
+    mg = np.linalg.norm(f, axis=1).reshape(grid_x.shape)
+    ux_t = -f[:, 0].reshape(grid_x.shape)
+    uy_t = -f[:, 1].reshape(grid_x.shape)
+    ax.imshow(mg, extent=[-2.5, 2.5, -2.5, 2.5], origin="lower", cmap="viridis", alpha=0.55, vmin=0)
+    sub_t = 3
+    mag_t = np.sqrt(ux_t**2 + uy_t**2) + 1e-8
+    ax.quiver(grid_x[::sub_t, ::sub_t], grid_y[::sub_t, ::sub_t],
+              (ux_t / mag_t)[::sub_t, ::sub_t], (uy_t / mag_t)[::sub_t, ::sub_t],
+              angles="xy", scale_units="xy", scale=6, color="tab:red", alpha=0.85, width=0.006)
+    ax.scatter(x0_data[:, 0], x0_data[:, 1], s=2, alpha=0.4, c="white", edgecolors="none")
+    ax.set_title(f"t = {t_val}    " + r"$\\bar\\alpha_t$" + f" = {alpha_bars[t_val].item():.3f}")
+    ax.set_xlim(-2.5, 2.5); ax.set_ylim(-2.5, 2.5); ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+plt.suptitle(r"Score field at six timesteps (top-left = pure noise → bottom-right = almost clean data)", y=1.0)
+plt.tight_layout(); plt.show()
+"""))
+
+cells.append(md(r"""\
+**Reading the evolution panel:**
+
+- **$t = 199$ (top-left, pure noise)**: arrows are gentle, magnitude is small everywhere. The model knows "data is roughly in the centre" but doesn't have a strong opinion about exactly where. At this timestep $\bar\alpha_t \approx 0$, so noised data lives all over $\mathbb{R}^2$ — the score is smooth.
+- **$t = 100$ (mid)**: arrows start to channel toward a curve. Some directional preference appears.
+- **$t = 50$**: arrows clearly converge onto the spiral.
+- **$t = 10$ (bottom-right, almost clean)**: arrows are sharp and concentrated right at the spiral. Magnitude is near zero *on* the spiral (no denoising needed there) and high just off it (a small push will put you back on).
+
+This is **annealed score matching** (Song & Ermon 2019, [arXiv 1907.05600](https://arxiv.org/abs/1907.05600)). At high noise (early reverse), the model is doing "coarse" denoising — getting the broad shape right. At low noise (late reverse), it's doing "fine" denoising — pulling sharp lines into place. The smooth transition from coarse-to-fine is what produces high-quality samples.
+
+### Connection to the paper
+
+DDPM's $\varepsilon$-prediction loss is *exactly* training a score-matching model at every noise level:
+$$\nabla_{x_t} \log q(x_t \mid x_0) = -\frac{\varepsilon}{\sqrt{1-\bar\alpha_t}}$$
+(derived from $q(x_t \mid x_0)$ being Gaussian; the gradient of a Gaussian log-density is a known scaled-noise expression.)
+
+So the network's $\varepsilon$-prediction *is* the score, up to a known scalar. The score field plots above are showing the network has correctly learned this gradient field at every noise level.
+
+This is §3.2 of the paper's main theoretical contribution — connecting variational diffusion (the ELBO derivation) to score-based generative modeling (Song 2019). Same algorithm, two derivations.
+"""))
+
+# ============================================================================
+# Section 10b — Why there's a noise term in the reverse process
+# ============================================================================
+cells.append(md(r"""\
+## Section 10b — Why the reverse process has a noise term $\sigma_t\,z$
+
+A natural question after seeing the streamlines: *if the score field defines deterministic trajectories from noise to data, why does the paper's Algorithm 2 add a random $\sigma_t\,z$ at every reverse step?*
+
+**Paper Algorithm 2 line 4** (reproduced):
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\Bigl(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\varepsilon_\theta(x_t, t)\Bigr) + \sigma_t\,z, \qquad z \sim \mathcal{N}(0, I) \text{ if } t > 1$$
+
+The $\sigma_t\,z$ at the end is the noise injection. Where does it come from and why is it there?
+
+### Where it comes from mathematically
+
+The reverse process is defined in the paper (equation 1) as a Gaussian:
+
+$$p_\theta(x_{t-1} \mid x_t) := \mathcal{N}\bigl(x_{t-1};\ \mu_\theta(x_t, t),\ \Sigma_\theta(x_t, t)\bigr)$$
+
+It's a **distribution**, not a deterministic function. To sample $x_{t-1}$ from this Gaussian we use the same reparameterization trick from Section 6:
+
+$$x_{t-1} = \mu_\theta + \sigma_t\,z, \qquad z \sim \mathcal{N}(0, I)$$
+
+where $\sigma_t = \sqrt{\Sigma_\theta}$ (standard deviation). The first part $\mu_\theta$ is given by Equation 11 of the paper (the ε-parameterized mean); the second part $\sigma_t\,z$ is the standard-deviation × standard-normal that *makes the sample stochastic*.
+
+The same trick as the forward process — except now we're sampling from the *reverse* Gaussian instead of the *forward* one.
+
+### What does the paper say about choosing $\sigma_t$?
+
+Paper §3.2:
+
+> "We set $\Sigma_\theta(x_t, t) = \sigma^2_t\,I$ to untrained time dependent constants. Experimentally, both $\sigma^2_t = \beta_t$ and $\sigma^2_t = \tilde\beta_t$ had similar results. The first choice is optimal for $x_0 \sim \mathcal{N}(0, I)$, and the second is optimal for $x_0$ deterministically set to one point. These are the two extreme choices corresponding to upper and lower bounds on reverse process entropy for data with coordinatewise unit variance."
+
+Two takeaways:
+1. The variance is **fixed**, not learned. (Later "Improved DDPM" by Nichol & Dhariwal 2021 makes it learnable; the YHL04 reference notebook in `day2_diffusion.ipynb` uses that improvement.)
+2. The two reasonable choices for $\sigma^2_t$ — namely $\beta_t$ (the forward step noise) and $\tilde\beta_t$ (the posterior variance from equation 7) — give similar empirical results.
+
+### "Why does this help generation quality? Why not just deterministic?"
+
+Three angles on the same answer:
+
+**Angle 1 — The objective is fundamentally stochastic.** We're approximating $q(x_{t-1} \mid x_t)$, which under DDPM's forward process is a Gaussian *distribution*, not a delta. A Gaussian distribution has nonzero variance. To match that distribution, the reverse process must inject randomness — that's $\sigma_t z$. Removing it changes the *target* distribution, not just the implementation.
+
+**Angle 2 — Stochasticity injects diversity and corrects compounding errors.** Each reverse step has a small but inevitable error in $\mu_\theta$ (the model isn't perfect). Without noise injection, those errors compound deterministically over 1000 steps — the trajectory could drift off the manifold without any chance to recover. The $\sigma_t z$ acts as a *correction mechanism*: it spreads the trajectory across nearby paths each step, letting subsequent denoising steps pull *averaged* paths back toward the manifold. Empirically this gives sharper samples than a purely deterministic flow.
+
+**Angle 3 — Deterministic sampling exists too, and it's called DDIM.** Song, Meng, Ermon 2020 ([arXiv 2010.02502](https://arxiv.org/abs/2010.02502)) showed that you *can* run the reverse process deterministically with the same trained model by setting $\sigma_t = 0$ (their parameter $\eta = 0$). DDIM is what the streamlines in View 2 above are tracing. Empirically:
+   - **DDPM (stochastic, $\sigma_t > 0$)**: slightly better sample quality, especially with many steps.
+   - **DDIM (deterministic, $\sigma_t = 0$)**: faster (because you can subsample timesteps without quality loss), reproducible (same starting noise → same output).
+   - Modern production samplers (DPM-Solver, Heun, Karras EDM) are also deterministic, trading the stochastic quality boost for speed.
+
+So the paper's added noise isn't a magical "increases detail" knob — it's the natural consequence of defining the reverse process as a Gaussian *distribution*, and it has the practical effect of regularizing the trajectory against compounding errors. Removing it gives DDIM and is the basis of every fast modern sampler.
+
+### Demonstration: stochastic vs deterministic reverse on the spiral
+
+Compare two sampling runs from the same starting noise: one with $\sigma_t = \sqrt{\beta_t}$ (DDPM stochastic), one with $\sigma_t = 0$ (DDIM-style deterministic). With the same trained model, they take *different paths* to the spiral but both reach it.
+"""))
+cells.append(code("""\
+@torch.no_grad()
+def sample_compare(model, n_samples=500, deterministic=False):
+    model.eval()
+    betas_dev = betas.to(DEVICE)
+    alphas_dev = alphas.to(DEVICE)
+    ab_dev = alpha_bars.to(DEVICE)
+    x = torch.randn(n_samples, 2, device=DEVICE)
+    for t in reversed(range(T)):
+        t_b = torch.full((n_samples,), t, device=DEVICE, dtype=torch.long)
+        eps_pred = model(x, t_b)
+        ab_t = ab_dev[t]; a_t = alphas_dev[t]; b_t = betas_dev[t]
+        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()
+        if t > 0 and not deterministic:
+            x = mean + b_t.sqrt() * torch.randn_like(x)
+        else:
+            x = mean
+    return x.cpu()
+
+torch.manual_seed(42)
+sto = sample_compare(model, deterministic=False)
+torch.manual_seed(42)
+det = sample_compare(model, deterministic=True)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].scatter(x0_data[:, 0], x0_data[:, 1], s=3, alpha=0.4, c="tab:blue"); axes[0].set_title("real spiral"); axes[0].set_aspect("equal"); axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5); axes[0].grid(alpha=0.3)
+axes[1].scatter(sto[:, 0], sto[:, 1], s=3, alpha=0.5, c="tab:green"); axes[1].set_title(r"DDPM stochastic $\\sigma_t = \\sqrt{\\beta_t}$"); axes[1].set_aspect("equal"); axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5); axes[1].grid(alpha=0.3)
+axes[2].scatter(det[:, 0], det[:, 1], s=3, alpha=0.5, c="tab:red"); axes[2].set_title(r"DDIM-style deterministic $\\sigma_t = 0$"); axes[2].set_aspect("equal"); axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5); axes[2].grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+# NN-distance metric for each
+def nn_dist_metric(samples, real):
+    d = torch.cdist(samples, real).min(dim=1).values
+    return d.median().item()
+
+real_baseline = nn_dist_metric(x0_data, x0_data)   # near 0 due to self-distance
+# proper baseline: real-to-real excluding self
+nn_real_full = torch.cdist(x0_data, x0_data); nn_real_full.fill_diagonal_(float('inf'))
+real_baseline = nn_real_full.min(dim=1).values.median().item()
+print(f"real-to-real median NN dist (baseline): {real_baseline:.4f}")
+print(f"DDPM stochastic samples -> real: {nn_dist_metric(sto, x0_data):.4f}   ratio {nn_dist_metric(sto, x0_data)/real_baseline:.2f}x")
+print(f"DDIM deterministic samples -> real: {nn_dist_metric(det, x0_data):.4f}   ratio {nn_dist_metric(det, x0_data)/real_baseline:.2f}x")
+"""))
+
+cells.append(md(r"""\
+**Reading the comparison:** both samplers produce samples that lie on the spiral, but their distributions look slightly different:
+- **DDPM (stochastic)**: spread is similar to the real data, samples diverse and on-distribution.
+- **DDIM (deterministic)**: samples often *cluster* — the deterministic ODE maps a region of starting noise to a single output point on the spiral, so multiple noise inputs near each other collapse to the same point. You see fewer distinct samples for the same number of starting points.
+
+This is the practical reason the paper kept the $\sigma_t z$ term: it produces *more diverse* coverage of the data distribution. The cost is reproducibility (different seeds give different outputs) and inability to skip steps efficiently.
+
+For deployment, modern systems usually use *deterministic* samplers (DDIM, DPM-Solver, EDM) with **fewer steps** because (a) they're faster, (b) the loss of diversity is small at the per-image level, and (c) classifier-free guidance + larger models compensate.
 """))
 
 # ============================================================================
