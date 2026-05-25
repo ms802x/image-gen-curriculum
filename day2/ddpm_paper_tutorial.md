@@ -709,6 +709,45 @@ See the companion notebook **`day2/day2_paper_math_to_code.ipynb`** for code-lev
 
 ---
 
+## Q&A — what if we skipped the isotropic noise in the forward process?
+
+A natural question from the math: the forward step is $x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\varepsilon$. What if we drop the $+\sqrt{\beta_t}\,\varepsilon$ term? Why is the noise there at all?
+
+**Short answer.** The whole DDPM machinery breaks — not just degrades. The noise is load-bearing.
+
+**What specifically fails:**
+
+1. **The forward distribution becomes a delta.** Without noise, $q(x_t \mid x_0)$ is a single point at $\sqrt{\bar\alpha_t}\,x_0$, not a Gaussian. Zero variance.
+
+2. **All data collapses to a single point at $t = T$.** Since $\sqrt{\bar\alpha_T} \to 0$, every $x_0$ gets mapped to 0. The forward chain destroys information *but doesn't replace it with anything* — you end up with a delta at 0, not standard Gaussian noise.
+
+3. **The prior $p(x_T) = \mathcal{N}(0, I)$ no longer matches the forward endpoint.** Sampling at inference time starts from Gaussian noise — input the model has never seen — so the reverse process is undefined.
+
+4. **The variational bound becomes infinite.** Each term $L_T$ and $L_{t-1}$ is a KL divergence; KL between a delta and a continuous Gaussian is $+\infty$. The training loss literally cannot be evaluated.
+
+5. **ε-prediction is impossible.** No noise was added → no $\varepsilon$ to predict. If we sample random $\varepsilon$ as a target anyway, the model has no information in the input that relates to it. Loss bottoms out at $\text{Var}(\varepsilon) = 1$ and the model never learns anything.
+
+**The deeper conceptual reason — the manifold problem.** The data distribution $q(x_0)$ is concentrated on a thin manifold (the spiral curve in 2D, the natural-image manifold in high dimensions). Outside that manifold, $q(x_0) = 0$. The **score function** $\nabla_x \log q(x)$ is therefore undefined off the manifold (it would be $-\infty$). Score-based sampling needs a defined score function everywhere, because the sampling trajectory passes through the whole space.
+
+**The isotropic noise solves this by smearing $q$ across all of $\mathbb{R}^d$.** Convolution with $\mathcal{N}(0, \sigma^2 I)$ inflates the thin data manifold into a thick cloud with smooth density everywhere. The score is well-defined on this thick cloud, and the model can learn it. That smearing *is* what the forward process is doing — adding noise to create a sequence of progressively-smoothed densities whose scores are progressively easier to estimate.
+
+Without the noise, the data lives on a measure-zero set with no learnable signal off it. With the noise, the noisified densities are smooth and learnable everywhere.
+
+This is the bridge between the variational DDPM framing and the score-matching framing: the noise term has the *same* role in both — to expand the data manifold so the gradient field of log-density exists across $\mathbb{R}^d$.
+
+**Comparison table.**
+
+| Without isotropic noise | With it (DDPM) |
+|---|---|
+| $q(x_t \mid x_0)$ is a delta at $\sqrt{\bar\alpha_t}\,x_0$ | $q(x_t \mid x_0)$ is a Gaussian with variance $(1-\bar\alpha_t)\,I$ |
+| All data collapses to 0 at $t=T$ | All data → $\mathcal{N}(0, I)$ at $t=T$ |
+| Prior $p(x_T) = \mathcal{N}(0, I)$ doesn't match the forward endpoint | Prior matches |
+| $L_T$ and $L_{t-1}$ have infinite KL (delta vs Gaussian) | Both terms are finite Gaussian KLs in closed form |
+| ε-prediction has no signal | ε-prediction = score function up to scaling |
+| Data manifold has zero measure, score is undefined off it | Noisified density covers $\mathbb{R}^d$, score is well-defined |
+
+---
+
 ## Further reading — the best resources to deepen this material
 
 **Honest preamble.** There is **no Goodfellow-Bengio-Courville-equivalent textbook for diffusion models** as of 2026. The field is too young and moves too fast for that kind of consolidation. What exists instead is a handful of *book-length tutorials* (PDFs and arXiv preprints) plus excellent blog posts. The list below ranks them by usefulness for the goal you stated: *understanding the math deeply*. Every entry is verified — links go to real, currently-available resources.
