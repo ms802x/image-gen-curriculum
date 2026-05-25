@@ -706,3 +706,66 @@ That's the full lineage you've been seeing in the curriculum. DDPM is the founda
 ---
 
 See the companion notebook **`day2/day2_paper_math_to_code.ipynb`** for code-level translations of every equation in this tutorial: numerical verifications of the closed-form forward process, KL divergence between Gaussians, the $\tilde\mu_t$ posterior, ε-parameterization equivalence, and the training/sampling algorithms.
+
+---
+
+## Further reading — the best resources to deepen this material
+
+**Honest preamble.** There is **no Goodfellow-Bengio-Courville-equivalent textbook for diffusion models** as of 2026. The field is too young and moves too fast for that kind of consolidation. What exists instead is a handful of *book-length tutorials* (PDFs and arXiv preprints) plus excellent blog posts. The list below ranks them by usefulness for the goal you stated: *understanding the math deeply*. Every entry is verified — links go to real, currently-available resources.
+
+### Tier 1 — read these first
+
+**1. Stanley H. Chan — "Tutorial on Diffusion Models for Imaging and Vision"**
+[arXiv 2403.18103](https://arxiv.org/abs/2403.18103) (latest v3 published January 2025, also in *Foundations and Trends in Computer Graphics and Vision*, vol. 16, pp. 322–471)
+
+The closest thing to a textbook treatment that currently exists. ~150 pages. Starts from VAE, builds through DDPM, score-based models, and stochastic differential equations. The pedagogical style is graduate-textbook quality, not just a paper. **If you want one single resource, this is it.**
+
+**2. Calvin Luo — "Understanding Diffusion Models: A Unified Perspective"**
+[arXiv 2208.11970](https://arxiv.org/abs/2208.11970), also as a [blog post](https://calvinyluo.com/2022/08/26/diffusion-tutorial.html)
+
+Shorter (~30 pages) but the most widely-recommended *derivation*. Goes through the same material as this tutorial but in a more unified order: variational diffusion as a hierarchical VAE, then connects to score-based modeling via Tweedie's formula. Especially helpful if the VAE-to-DDPM connection felt fuzzy in our walkthrough.
+
+### Tier 2 — supplementary
+
+**3. *Generative Diffusion Modeling: A Practical Handbook*** (Wang et al., December 2024)
+[arXiv 2412.17162](https://arxiv.org/abs/2412.17162)
+
+Newer than Chan's tutorial. Unifies DDPM, score-based models, consistency models, rectified flow, and flow matching under standardized notation. **Use it as a Rosetta stone** between different formulations you'll see in newer papers.
+
+**4. Yang Song — *Generative Modeling by Estimating Gradients of the Data Distribution*** (blog)
+[yang-song.net/blog/2021/score](https://yang-song.net/blog/2021/score/)
+
+By the author of the score-based / SDE formulation. The clearest introduction to the score-matching perspective, which is conceptually simpler than DDPM's variational derivation. Not a book; ~20-minute read.
+
+**5. Sander Dieleman — diffusion blog series**
+[sander.ai/2022/01/31/diffusion.html](https://sander.ai/2022/01/31/diffusion.html) and follow-ups
+
+Not a book either, but widely considered the best *intuitive* coverage in the field. Strong on engineering instinct: what each design choice means in practice, what's load-bearing math vs. historical baggage.
+
+### Tier 3 — printed books (skip if you have Tier 1 access)
+
+**6. David Foster — *Generative Deep Learning* (2nd ed.)** (O'Reilly, 2023, ISBN 978-1098134181)
+
+Chapter 8 covers diffusion models with code. Beginner-friendly, less mathematical depth than Chan or Luo. Good for a printed book on your shelf if you're approaching from a broader generative-AI background.
+
+**7. Anand Vemula — *Diffusion Models: A Practical Guide to AI Image Generation*** (Amazon Kindle, 2024)
+
+Practitioner-focused. Light on theory. **Not recommended for understanding the math** — Tier 1 does its job better.
+
+### Tier 4 — being written
+
+**8. *The Art and Science of Diffusion Models in Generative AI*** (expected late 2025)
+[diffusion-book.com](https://diffusion-book.com/), [GitHub](https://github.com/BoltzmannEntropy/DDPM)
+
+Upcoming graduate-level textbook covering Brownian motion, Itô's lemma, SDEs, and DDPMs with extensive solved problems. Could become the canonical textbook if finalized as described. Not yet published at time of writing.
+
+### Recommended reading order for your stated goal
+
+Given that you've just worked through the DDPM paper closely (this tutorial) and want to *deepen* the math:
+
+1. **Calvin Luo's 30-page tutorial** first. Re-derives what we covered, using his unified VAE-to-diffusion framing. Cheap to read and cross-validates your understanding.
+2. **Stanley Chan's 150-page tutorial** next. The comprehensive textbook treatment — "what we did, but with more rigor and breadth."
+3. **Sander Dieleman's blog** for the engineering-intuition layer.
+4. **Yang Song's score-based blog** for the alternative score-matching path through the same material.
+
+That sequence leaves you with both *variational* and *score-based* perspectives, plus practitioner intuition. After it, the modern papers (DDIM, EDM, flow matching, consistency models) read as variations on a theme rather than each requiring a fresh framework.
