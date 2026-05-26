@@ -1036,10 +1036,158 @@ In the DDPM loss, the network's reverse step $p_\theta(x_{t-1} \mid x_t)$ is *tr
 """))
 
 # ============================================================================
-# Section 13 — Summary
+# Section 13 — DDPM end-to-end, in one place
 # ============================================================================
 cells.append(md(r"""\
-## Section 13 — Summary
+## Section 13 — DDPM end-to-end, in one place
+
+After all the math, here's the **entire DDPM pipeline as one self-contained block of code**. Everything you need to train and sample, in ~40 lines.
+
+### Motivation in one paragraph
+
+> We want to generate samples from a target distribution we only have data from (the spiral). DDPM's trick: define a **fixed** forward process that gradually destroys the data with Gaussian noise, then **learn** the reverse process. To learn the reverse, train a network to predict the noise that was added at any timestep — that prediction *is* the score (up to a scalar) of the noisified data distribution. To generate, start with random noise and follow the learned denoising direction step by step.
+
+### The six pieces
+
+1. **Schedule** — how much noise per step ($\beta_t, \alpha_t, \bar\alpha_t$).
+2. **Forward** — turn clean $x_0$ into noisy $x_t$ in one shot.
+3. **Network** — predicts the noise given $x_t$ and $t$.
+4. **Loss** — MSE between predicted and true noise.
+5. **Training** — repeatedly sample data, noise it, predict, update.
+6. **Sampling** — start from pure noise, denoise step by step.
+
+Below, all six are inlined. The visualization helper is predefined so the core code stays uncluttered.
+"""))
+
+cells.append(code("""\
+# A predefined visualization helper -- keeps the core code below uncluttered
+def viz_real_vs_samples(real, samples, ratio=None):
+    \"\"\"3-panel: real / samples / overlay.\"\"\"
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].scatter(real[:, 0], real[:, 1], s=3, alpha=0.5, c="tab:blue")
+    axes[0].set_title(r"real data $q(x_0)$"); axes[0].set_aspect("equal")
+    axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5); axes[0].grid(alpha=0.3)
+
+    title2 = r"model samples $p_\\theta(x_0)$"
+    if ratio is not None: title2 += f"   (NN-ratio: {ratio:.2f}x)"
+    axes[1].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.5, c="tab:green")
+    axes[1].set_title(title2); axes[1].set_aspect("equal")
+    axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5); axes[1].grid(alpha=0.3)
+
+    axes[2].scatter(real[:, 0], real[:, 1], s=3, alpha=0.3, c="tab:blue", label="real")
+    axes[2].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.3, c="tab:green", label="samples")
+    axes[2].set_title("overlay"); axes[2].set_aspect("equal"); axes[2].legend()
+    axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5); axes[2].grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+"""))
+
+cells.append(code("""\
+# ============================================================
+# DDPM end-to-end on the spiral, ~40 lines total
+# ============================================================
+import time
+torch.manual_seed(123)
+
+# === (1) Schedule ===
+T = 200
+betas = torch.linspace(1e-4, 0.05, T, device=DEVICE)
+alphas = 1.0 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)
+
+# === (2,3) Forward (inline below) + Network ===
+# ResMLP was defined in Section 8; using a smaller copy for a fast self-contained demo.
+torch.manual_seed(123)
+demo_model = ResMLP(hidden=128, n_blocks=3).to(DEVICE)
+optim = torch.optim.AdamW(demo_model.parameters(), lr=2e-3, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=20000)
+x_data = x0_data.to(DEVICE)
+
+# === (4,5) Training loop ===
+t0 = time.time()
+for step in range(20000):
+    idx   = torch.randint(0, len(x_data), (256,), device=DEVICE)
+    x_0   = x_data[idx]
+    t     = torch.randint(0, T, (256,), device=DEVICE)
+    eps   = torch.randn_like(x_0)
+    ab_t  = alpha_bars[t].view(-1, 1)
+    x_t   = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps    # forward (closed form)
+    pred  = demo_model(x_t, t)                             # network predicts noise
+    loss  = F.mse_loss(pred, eps)                          # MSE on noise
+    optim.zero_grad(); loss.backward(); optim.step(); sched.step()
+    if step % 5000 == 0:
+        print(f"step {step:5d}  loss={loss.item():.4f}  time={time.time()-t0:.1f}s")
+print(f"training done in {time.time()-t0:.1f}s\\n")
+
+# === (6) Sampling: 200 reverse steps from pure noise ===
+demo_model.eval()
+with torch.no_grad():
+    x = torch.randn(2000, 2, device=DEVICE)                # x_T ~ N(0, I)
+    for t in reversed(range(T)):
+        t_b = torch.full((2000,), t, device=DEVICE, dtype=torch.long)
+        eps_pred = demo_model(x, t_b)
+        ab_t = alpha_bars[t]; a_t = alphas[t]; b_t = betas[t]
+        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()   # eq 11 mean
+        if t > 0:
+            x = mean + b_t.sqrt() * torch.randn_like(x)                  # + sigma_t * z
+        else:
+            x = mean
+samples = x.cpu()
+"""))
+
+cells.append(code("""\
+# === Verification + visualization ===
+nn_samp = torch.cdist(samples, x0_data).min(dim=1).values.median().item()
+nn_real_mat = torch.cdist(x0_data, x0_data); nn_real_mat.fill_diagonal_(float('inf'))
+nn_real = nn_real_mat.min(dim=1).values.median().item()
+ratio = nn_samp / nn_real
+print(f"NN-distance ratio (samples vs real): {ratio:.2f}x")
+print(f"  <1.5x: excellent     1.5-3x: good     >3x: needs more training")
+
+viz_real_vs_samples(x0_data, samples, ratio=ratio)
+"""))
+
+cells.append(md(r"""\
+### What just happened, line by line
+
+| Line | What it does | Paper reference |
+|---|---|---|
+| `betas = torch.linspace(...)` | Define noise schedule | §4 |
+| `alphas = 1 - betas` | $\alpha_t = 1 - \beta_t$ | §2 (intro) |
+| `alpha_bars = torch.cumprod(alphas, dim=0)` | $\bar\alpha_t = \prod_{s=1}^{t} \alpha_s$ | §2 (intro), eq 4 setup |
+| `x_t = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps` | Forward, eq 4 sample form | eq 4 |
+| `pred = demo_model(x_t, t)` | $\varepsilon_\theta(x_t, t)$ | §3.2 |
+| `loss = F.mse_loss(pred, eps)` | Simplified loss | eq 14 ($L_\text{simple}$) |
+| `x = torch.randn(2000, 2)` (sampling) | $x_T \sim \mathcal{N}(0, I)$ | Algorithm 2 line 1 |
+| `mean = (x - ...) / a_t.sqrt()` | $\mu_\theta$ from eq 11 | eq 11 |
+| `x = mean + b_t.sqrt() * torch.randn_like(x)` if $t>0$ | $\sigma_t z$ stochastic term | Algorithm 2 line 4 |
+
+### Why this is the "whole story" of DDPM
+
+Every conceptual piece you've seen in the paper has a single line of code above:
+
+- **Reparameterization trick** → `ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps` (one line, both forward sampling and the structural form of equation 4)
+- **ε-prediction** → `demo_model(x_t, t)` produces $\varepsilon_\theta$ directly (no auxiliary heads or interpolation)
+- **L_simple objective** → `F.mse_loss(pred, eps)`. That's the entire loss. No KL, no learned variance, no variational bound (those are derivations that *justify* this loss)
+- **Algorithm 2 reverse step** → the inner `for t in reversed(range(T))` loop. Three lines: predict noise, compute the mean, add stochastic noise
+- **Stochasticity in sampling** → the `if t > 0` branch that adds $\sigma_t z$; remove it and you have deterministic DDIM
+
+If you can read these ~40 lines and follow what each one does, **you understand DDPM**. The rest of this notebook explains *why* each line is correct from the paper's variational derivation, but the operational story is right here.
+
+### Confused about a specific part?
+
+Go back to:
+- The forward math: Section 2–4
+- The schedule: Section 4 plots
+- Reparameterization trick (where the noise term "appears"): Q&A in `ddpm_paper_tutorial.md`
+- The reverse mean formula: Section 5–6 of the tutorial markdown (ε-parameterization)
+- Why the stochastic term: Section 10b above
+"""))
+
+# ============================================================================
+# Section 14 — Original summary (kept)
+# ============================================================================
+cells.append(md(r"""\
+## Section 14 — Concept-to-section map
 
 We translated the entire DDPM math into visualized 2D operations:
 
