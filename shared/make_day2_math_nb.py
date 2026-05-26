@@ -1060,90 +1060,119 @@ Below, all six are inlined. The visualization helper is predefined so the core c
 """))
 
 cells.append(code("""\
-# A predefined visualization helper -- keeps the core code below uncluttered
-def viz_real_vs_samples(real, samples, ratio=None):
-    \"\"\"3-panel: real / samples / overlay.\"\"\"
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].scatter(real[:, 0], real[:, 1], s=3, alpha=0.5, c="tab:blue")
-    axes[0].set_title(r"real data $q(x_0)$"); axes[0].set_aspect("equal")
-    axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5); axes[0].grid(alpha=0.3)
+# ============================================================================
+# DDPM, FULLY SELF-CONTAINED. Imports, data, model, training, sampling, plot.
+# Nothing in this cell depends on anything defined earlier in the notebook.
+# Copy-paste this cell into a fresh Python session and it runs.
+# ============================================================================
+import math, time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-    title2 = r"model samples $p_\\theta(x_0)$"
-    if ratio is not None: title2 += f"   (NN-ratio: {ratio:.2f}x)"
-    axes[1].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.5, c="tab:green")
-    axes[1].set_title(title2); axes[1].set_aspect("equal")
-    axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5); axes[1].grid(alpha=0.3)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(0)
 
-    axes[2].scatter(real[:, 0], real[:, 1], s=3, alpha=0.3, c="tab:blue", label="real")
-    axes[2].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.3, c="tab:green", label="samples")
-    axes[2].set_title("overlay"); axes[2].set_aspect("equal"); axes[2].legend()
-    axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5); axes[2].grid(alpha=0.3)
-    plt.tight_layout(); plt.show()
-"""))
+# ---------- (0) Data -- a 2D spiral as our toy 'image' distribution q(x_0) ----------
+def make_spiral(n=5000, noise=0.03):
+    theta = torch.linspace(0, 4 * math.pi, n)
+    r = theta / (4 * math.pi)
+    x = r * torch.cos(theta) + noise * torch.randn(n)
+    y = r * torch.sin(theta) + noise * torch.randn(n)
+    return torch.stack([x, y], dim=1) * 2.0
 
-cells.append(code("""\
-# ============================================================
-# DDPM end-to-end on the spiral, ~40 lines total
-# ============================================================
-import time
-torch.manual_seed(123)
+x0_cpu = make_spiral()
+x0_dev = x0_cpu.to(DEVICE)
 
-# === (1) Schedule ===
+# ---------- (1) Schedule (paper eq 2 setup) ----------
 T = 200
 betas = torch.linspace(1e-4, 0.05, T, device=DEVICE)
 alphas = 1.0 - betas
 alpha_bars = torch.cumprod(alphas, dim=0)
 
-# === (2,3) Forward (inline below) + Network ===
-# ResMLP was defined in Section 8; using a smaller copy for a fast self-contained demo.
-torch.manual_seed(123)
-demo_model = ResMLP(hidden=128, n_blocks=3).to(DEVICE)
-optim = torch.optim.AdamW(demo_model.parameters(), lr=2e-3, weight_decay=1e-4)
-sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=20000)
-x_data = x0_data.to(DEVICE)
+# ---------- (2) Network: predicts noise eps_theta(x_t, t) ----------
+class TimeEmb(nn.Module):
+    def __init__(self, dim): super().__init__(); self.dim = dim
+    def forward(self, t):
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / (half - 1))
+        args = t.float()[:, None] * freqs[None]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
-# === (4,5) Training loop ===
+class ResMLP(nn.Module):
+    def __init__(self, hidden=128, t_dim=128, n_blocks=3):
+        super().__init__()
+        self.t_emb = TimeEmb(t_dim)
+        self.in_proj = nn.Linear(2 + t_dim, hidden)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(),
+                          nn.Linear(hidden, hidden), nn.SiLU())
+            for _ in range(n_blocks)
+        ])
+        self.out = nn.Linear(hidden, 2)
+    def forward(self, x, t):
+        h = self.in_proj(torch.cat([x, self.t_emb(t)], dim=-1))
+        for blk in self.blocks: h = h + blk(h)
+        return self.out(h)
+
+torch.manual_seed(0)
+model = ResMLP().to(DEVICE)
+optim = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=20000)
+
+# ---------- (3,4,5) Training loop -- paper Algorithm 1, with L_simple ----------
 t0 = time.time()
 for step in range(20000):
-    idx   = torch.randint(0, len(x_data), (256,), device=DEVICE)
-    x_0   = x_data[idx]
-    t     = torch.randint(0, T, (256,), device=DEVICE)
-    eps   = torch.randn_like(x_0)
-    ab_t  = alpha_bars[t].view(-1, 1)
-    x_t   = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps    # forward (closed form)
-    pred  = demo_model(x_t, t)                             # network predicts noise
-    loss  = F.mse_loss(pred, eps)                          # MSE on noise
+    idx     = torch.randint(0, len(x0_dev), (256,), device=DEVICE)
+    x_0     = x0_dev[idx]
+    t_step  = torch.randint(0, T, (256,), device=DEVICE)
+    eps     = torch.randn_like(x_0)
+    ab_t    = alpha_bars[t_step].view(-1, 1)
+    x_t     = ab_t.sqrt() * x_0 + (1 - ab_t).sqrt() * eps            # forward (eq 4)
+    pred    = model(x_t, t_step)                                     # network output
+    loss    = F.mse_loss(pred, eps)                                  # L_simple (eq 14)
     optim.zero_grad(); loss.backward(); optim.step(); sched.step()
     if step % 5000 == 0:
         print(f"step {step:5d}  loss={loss.item():.4f}  time={time.time()-t0:.1f}s")
-print(f"training done in {time.time()-t0:.1f}s\\n")
+print(f"training done in {time.time()-t0:.1f}s")
 
-# === (6) Sampling: 200 reverse steps from pure noise ===
-demo_model.eval()
+# ---------- (6) Sampling -- paper Algorithm 2 ----------
+model.eval()
 with torch.no_grad():
-    x = torch.randn(2000, 2, device=DEVICE)                # x_T ~ N(0, I)
-    for t in reversed(range(T)):
-        t_b = torch.full((2000,), t, device=DEVICE, dtype=torch.long)
-        eps_pred = demo_model(x, t_b)
-        ab_t = alpha_bars[t]; a_t = alphas[t]; b_t = betas[t]
-        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()   # eq 11 mean
-        if t > 0:
+    x = torch.randn(2000, 2, device=DEVICE)                          # x_T ~ N(0, I)
+    for t_step in reversed(range(T)):
+        t_b = torch.full((2000,), t_step, device=DEVICE, dtype=torch.long)
+        eps_pred = model(x, t_b)
+        ab_t = alpha_bars[t_step]; a_t = alphas[t_step]; b_t = betas[t_step]
+        mean = (x - (b_t / (1 - ab_t).sqrt()) * eps_pred) / a_t.sqrt()   # mean (eq 11)
+        if t_step > 0:
             x = mean + b_t.sqrt() * torch.randn_like(x)                  # + sigma_t * z
         else:
             x = mean
 samples = x.cpu()
-"""))
 
-cells.append(code("""\
-# === Verification + visualization ===
-nn_samp = torch.cdist(samples, x0_data).min(dim=1).values.median().item()
-nn_real_mat = torch.cdist(x0_data, x0_data); nn_real_mat.fill_diagonal_(float('inf'))
+# ---------- Verification: NN-distance ratio ----------
+nn_samp = torch.cdist(samples, x0_cpu).min(dim=1).values.median().item()
+nn_real_mat = torch.cdist(x0_cpu, x0_cpu); nn_real_mat.fill_diagonal_(float('inf'))
 nn_real = nn_real_mat.min(dim=1).values.median().item()
 ratio = nn_samp / nn_real
-print(f"NN-distance ratio (samples vs real): {ratio:.2f}x")
-print(f"  <1.5x: excellent     1.5-3x: good     >3x: needs more training")
+print(f"NN-distance ratio (samples vs real): {ratio:.2f}x   "
+      f"(<1.5x excellent, 1.5-3x good, >3x needs more training)")
 
-viz_real_vs_samples(x0_data, samples, ratio=ratio)
+# ---------- Visualization: 3-panel real / samples / overlay ----------
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].scatter(x0_cpu[:, 0], x0_cpu[:, 1], s=3, alpha=0.5, c="tab:blue")
+axes[0].set_title(r"real data $q(x_0)$"); axes[0].set_aspect("equal")
+axes[0].set_xlim(-2.5, 2.5); axes[0].set_ylim(-2.5, 2.5); axes[0].grid(alpha=0.3)
+axes[1].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.5, c="tab:green")
+axes[1].set_title(f"model samples   (NN-ratio: {ratio:.2f}x)"); axes[1].set_aspect("equal")
+axes[1].set_xlim(-2.5, 2.5); axes[1].set_ylim(-2.5, 2.5); axes[1].grid(alpha=0.3)
+axes[2].scatter(x0_cpu[:, 0], x0_cpu[:, 1], s=3, alpha=0.3, c="tab:blue", label="real")
+axes[2].scatter(samples[:, 0], samples[:, 1], s=3, alpha=0.3, c="tab:green", label="samples")
+axes[2].set_title("overlay"); axes[2].set_aspect("equal"); axes[2].legend()
+axes[2].set_xlim(-2.5, 2.5); axes[2].set_ylim(-2.5, 2.5); axes[2].grid(alpha=0.3)
+plt.tight_layout(); plt.show()
 """))
 
 cells.append(md(r"""\
